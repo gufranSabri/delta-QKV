@@ -1,0 +1,11 @@
+# truthfulqa x meta-llama/Meta-Llama-3-8B-Instruct
+# geometry: L=32  D_q=4096  D_kv=1024  ->  image 32x32 per view
+llm:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  alias: llama3_8b
+
+dataset:
+  name: truthfulqa
+  n_samples: 817
+  max_new_tokens: 64
+  prompt_template: "Answer the question concisely. Q: {question} A:"

@@ -1,0 +1,112 @@
+"""Correctness scoring by string matching.
+
+Adapted from ACT-ViT's `utils/generation_utils.py`, which in turn follows
+LLMsKnow (technion-cs-nlp/LLMsKnow). We keep their protocol so our numbers are
+comparable to theirs.
+
+Every function returns `correct` in {0, 1}. The hallucination label is the
+complement:  label = 1 - correct  (1 = hallucinated).
+
+WHY WE RE-ANNOTATE AT ALL
+-------------------------
+The dataset ships a gold answer, not a hallucination label. Once the LLM writes
+its OWN response, whether that response is a hallucination is a property of the
+generated text -- so the label has to be recomputed against the gold answer.
+Both baselines do exactly this; the schemes differ only in how they compare.
+"""
+
+from __future__ import annotations
+
+import ast
+
+
+def _as_list(value) -> list[str]:
+    """Normalise a gold field into a list of acceptable answer strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        # TriviaQA aliases sometimes arrive as a stringified list.
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, (list, tuple)):
+                    return [str(v) for v in parsed]
+            except (ValueError, SyntaxError):
+                pass
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def correctness_substring(answer: str, gold) -> int:
+    """Correct if ANY gold answer appears anywhere in the response.
+
+    Used for triviaqa (many aliases), hotpotqa and movies. Case-insensitive.
+    This is a lenient criterion -- it rewards a response that contains the right
+    answer even when buried in surrounding text, which is what these baselines do
+    (the models are prompted to answer concisely, so the response is short).
+    """
+    if not answer:
+        return 0
+    haystack = answer.lower()
+    for candidate in _as_list(gold):
+        needle = str(candidate).lower().strip()
+        if needle and needle in haystack:
+            return 1
+    return 0
+
+
+def correctness_imdb(answer: str, gold) -> int:
+    """Sentiment classification: does the response name the right sentiment?
+
+    Gold is 0 (negative) or 1 (positive), or the label word itself. We take
+    whichever of 'positive'/'negative' appears FIRST in the response -- a model
+    that says "negative ... though some find it positive" has answered negative.
+    """
+    if not answer:
+        return 0
+
+    names = {0: "negative", 1: "positive"}
+    if isinstance(gold, str):
+        gold_word = gold.lower().strip()
+    else:
+        gold_word = names.get(int(gold))
+    if gold_word not in ("negative", "positive"):
+        return 0
+
+    low = answer.lower()
+    i_neg = low.find("negative")
+    i_pos = low.find("positive")
+
+    if i_neg == -1 and i_pos == -1:
+        return 0  # no answer given
+    if i_pos == -1 or (i_neg != -1 and i_neg < i_pos):
+        predicted = "negative"
+    else:
+        predicted = "positive"
+    return int(predicted == gold_word)
+
+
+# Which scorer each dataset uses. `_test` variants share their parent's scorer.
+CORRECTNESS_FN = {
+    "triviaqa": correctness_substring,
+    "hotpotqa": correctness_substring,
+    "hotpotqa_with_context": correctness_substring,
+    "movies": correctness_substring,
+    "truthfulqa": correctness_substring,
+    "imdb": correctness_imdb,
+}
+
+
+def score_exact_match(dataset_name: str, answer: str, gold) -> tuple[float, int]:
+    """Returns (score, label). score is the 0/1 correctness; label = 1 - score."""
+    base = dataset_name.replace("_test", "")
+    if base not in CORRECTNESS_FN:
+        raise KeyError(
+            f"no exact-match scorer for dataset {dataset_name!r}. "
+            f"Known: {sorted(CORRECTNESS_FN)}"
+        )
+    correct = CORRECTNESS_FN[base](answer, gold)
+    return float(correct), 1 - correct

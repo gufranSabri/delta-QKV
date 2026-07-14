@@ -1,0 +1,11 @@
+# hotpotqa_with_context x meta-llama/Meta-Llama-3-8B-Instruct
+# geometry: L=32  D_q=4096  D_kv=1024  ->  image 32x32 per view
+llm:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  alias: llama3_8b
+
+dataset:
+  name: hotpotqa_with_context
+  n_samples: 10000
+  max_new_tokens: 100
+  prompt_template: "Answer the question concisely based on the context:\n{context}\nQ: {question} A:"

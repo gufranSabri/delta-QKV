@@ -1,0 +1,15 @@
+# Extracted features (huge) and training outputs
+data/
+runs/
+models/
+scripts/generated/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# OS
+.DS_Store

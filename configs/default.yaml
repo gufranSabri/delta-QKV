@@ -1,0 +1,53 @@
+# Base config. Every dataset x LLM config layers on top of this and overrides
+# only what differs. Values here are the defaults from the design discussion.
+
+llm:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  dtype: bfloat16
+  alias: llama3_8b            # used in output paths (no '/' in directory names)
+
+dataset:
+  name: triviaqa
+  n_samples: 10000
+  max_new_tokens: 100
+  prompt_template: "Answer the question concisely. Q: {question} A:"
+
+extract:
+  views: [Q, K, V]            # subset for ablations, e.g. [V]. Fusion adapts.
+  pool: max                   # max | mean | l2  -- how D is reduced to n_cols
+  boundary_mode: zero         # zero | replicate | wrap  (see tensor_ops.py)
+  dtype: float16
+  max_tokens: 100
+  n_cols: null                # null -> use the model's layer count => SQUARE image
+  l_eff: null                 # null -> keep the model's L. Set for cross-LLM runs.
+
+labeling:
+  scheme: exact_match         # exact_match | bleurt
+  bleurt_threshold: 0.5
+  bleurt_checkpoint: models/BLEURT-20-D12
+
+model:
+  backbone: scratch_cnn       # scratch_cnn | resnet18
+  share_backbone: false       # false => one CNN per view (Q, K, V untied)
+  embed_dim: 128              # E: per-view CNN output
+  fusion: gated               # gated | concat_mlp | bilinear | cross_attn
+  fused_dim: 128              # F: fusion output
+  conv1d_layers: 2
+  lstm_hidden: 128
+  lstm_layers: 1
+  dropout: 0.3
+  pretrained_backbone: true   # only used by resnet18
+
+train:
+  batch_size: 32
+  lr: 0.001
+  weight_decay: 0.0001
+  epochs: 30
+  patience: 8
+  seed: 0
+  num_workers: 4
+  val_fraction: 0.2
+  balance_classes: true
+
+data_root: data
+runs_root: runs

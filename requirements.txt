@@ -8,6 +8,8 @@ tqdm>=4.65
 torchvision>=0.16      # only for model.backbone=resnet18
 matplotlib>=3.7        # only for `main.py inspect`
 
+accelerate>=2.20
+
 # Testing
 pytest>=7.0
 

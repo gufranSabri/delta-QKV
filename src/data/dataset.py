@@ -33,8 +33,14 @@ class QKVImageDataset(Dataset):
         max_tokens: int | None = None,
         origin: str | None = None,
         channels: str = "default",
+        include: list[int] | None = None,
+        stream2_enable: bool = False,
+        stream2_include: list[int] | None = None,
     ):
         self.channels = channels
+        self.include = include
+        self.stream2_enable = stream2_enable
+        self.stream2_include = stream2_include
         self.root = Path(root)
         manifest = self.root / "manifest.jsonl"
         if not manifest.exists():
@@ -83,7 +89,10 @@ class QKVImageDataset(Dataset):
     def labels(self) -> list[int]:
         return [int(r["label"]) for r in self.records]
 
-    def __getitem__(self, i):
+    def _load_raw(self, i):
+        """(T, V, L, C, 3) for example i: requested views, un-normalised, before
+        `channels`/`include` reshape the image axis. This is the layout
+        normalisation stats are computed and applied over."""
         rec = self.records[i]
         path = self.root / rec["dir"] / "tokens.npy"
 
@@ -96,31 +105,70 @@ class QKVImageDataset(Dataset):
         if self.max_tokens is not None and images.shape[0] > self.max_tokens:
             images = images[: self.max_tokens]
 
+        return images
+
+    def _finish(self, raw: torch.Tensor, include: list[int] | None) -> torch.Tensor:
+        """normalize -> channels-to-conv-position -> regroup -> include.
+
+        `raw` is (*, V, L, D, 3) for stream 1 or (*, V, L, T, 3) for stream 2
+        (T and D swapped) -- this stage is agnostic to which axis is which,
+        it only cares about (V, ., ., 3) axis POSITIONS, matching
+        regroup_channels' own contract.
+        """
+        images = raw
         if self.stats is not None:
             images = normalize(images, self.stats, self.views)
 
-        # (T, V, L, C, 3) -> (T, V, 3, L, C): channels into conv position.
+        # (*, V, L, ., 3) -> (*, V, 3, L, .): channels into conv position.
         images = images.permute(0, 1, 4, 2, 3)
 
-        images = regroup_channels(images, self.channels).contiguous()
+        images = regroup_channels(images, self.channels)
 
-        return images, float(rec["label"]), self.origin
+        if include is not None:
+            images = images[:, include]
+
+        return images.contiguous()
+
+    def __getitem__(self, i):
+        rec = self.records[i]
+        raw = self._load_raw(i)                       # (T, V, L, D, 3)
+
+        images1 = self._finish(raw, self.include)
+
+        if not self.stream2_enable:
+            return images1, float(rec["label"]), self.origin
+
+        # Stream 2: T (generated tokens) becomes a spatial axis instead of the
+        # sequence axis; D (a fixed extract.n_cols for this run) takes T's old
+        # place as the axis folded into the batch by the model.
+        # raw is (T, V, L, D, 3) -> (D, V, L, T, 3).
+        raw2 = raw.permute(3, 1, 2, 0, 4)
+        images2 = self._finish(raw2, self.stream2_include)
+
+        return images1, images2, float(rec["label"]), self.origin
 
 
-def n_images(mode: str, n_views: int) -> int:
+def n_images(mode: str, n_views: int, include: list[int] | None = None) -> int:
     """How many images (i.e. CNN streams) `mode` produces from `n_views` views.
 
     This is what the model must be built for -- NOT len(extract.views), which is
     only the image count in `default` mode. `n_views` is 1 for the hidden-state
     source and up to 3 (Q/K/V) for the qkv source.
+
+    `include` (model.include) drops images by index AFTER regrouping -- it is
+    applied as the last step in __getitem__, so the model must be sized to its
+    length rather than the pre-filter count whenever it is set.
     """
     if mode == "default":
-        return n_views        # one image per view
-    if mode == "first_only":
-        return 1              # one image; the views became its channels
-    if mode == "same":
-        return 3              # one image per channel-type (raw, ch1, ch2)
-    raise ValueError(f"unknown model.channels mode {mode!r}")
+        total = n_views        # one image per view
+    elif mode == "first_only":
+        total = 1              # one image; the views became its channels
+    elif mode == "same":
+        total = 3              # one image per channel-type (raw, ch1, ch2)
+    else:
+        raise ValueError(f"unknown model.channels mode {mode!r}")
+
+    return len(include) if include is not None else total
 
 
 def n_channels(mode: str, n_views: int) -> int:
@@ -139,7 +187,7 @@ def regroup_channels(images: torch.Tensor, mode: str) -> torch.Tensor:
 
     images: (T, V, 3, L, C) -- V views, each a 3-channel image. The three
     channels are (raw, delta-prev, delta-next) under extraction_type=delta, or
-    (raw, DWT, FFT) under extraction_type=transforms; the regrouping is identical
+    (raw, DWT1, DWT2) under extraction_type=transforms; the regrouping is identical
     either way, since it only cares about channel POSITION, not meaning.
     Returns (T, V', C', L, C): V' images of C' channels each.
 
@@ -193,13 +241,6 @@ def normalize(images: torch.Tensor, stats: dict, views: list[str]) -> torch.Tens
     return (images - mean) / std.clamp(min=1e-6)
 
 
-def _get_stats(dataset):
-    """Read normalisation stats from a source or a concat-of-sources."""
-    if hasattr(dataset, "datasets"):        # ConcatQKVDataset
-        return dataset.datasets[0].stats
-    return dataset.stats
-
-
 def _set_stats(dataset, stats) -> None:
     """Attach stats to a source, or to every source inside a concat.
 
@@ -234,23 +275,18 @@ def compute_stats(
     sample = indices[:max_examples]
     logger.info("computing normalisation stats over %d training examples", len(sample))
 
-    # Read RAW values, not already-normalised ones -- otherwise recomputing stats
-    # on a dataset that already has them would standardise twice. `dataset` may
-    # be a ConcatQKVDataset, whose stats live on its child sources, so toggle
-    # through the helpers rather than touching `.stats` directly.
-    saved = _get_stats(dataset)
-    _set_stats(dataset, None)
-    try:
-        for i in sample:
-            images, _, _ = dataset[i]             # (T, V, 3, L, C) -- permuted!
-            x = images.double()
-            # channel axis is dim 2 after the permute in __getitem__
-            sums += x.sum(dim=(0, 3, 4))
-            sqs += (x**2).sum(dim=(0, 3, 4))
-            n = x.shape[0] * x.shape[3] * x.shape[4]
-            count += n
-    finally:
-        _set_stats(dataset, saved)
+    # Read RAW values via _load_raw -- (T, V, L, C, 3), before normalisation AND
+    # before `channels`/`include` reshape the image axis. Reading through
+    # __getitem__ instead would tie stats to a reshape/subset that has nothing
+    # to do with per-(view, channel) statistics, and would break outright once
+    # `include` drops images (the view axis no longer matches `views`).
+    for i in sample:
+        images = dataset._load_raw(i)             # (T, V, L, C, 3)
+        x = images.double()
+        sums += x.sum(dim=(0, 2, 3))
+        sqs += (x**2).sum(dim=(0, 2, 3))
+        n = x.shape[0] * x.shape[2] * x.shape[3]
+        count += n
 
     mean = sums / count.clamp(min=1)
     var = (sqs / count.clamp(min=1)) - mean**2
@@ -265,33 +301,70 @@ def compute_stats(
     }
 
 
+def _pad_stack(images_list: list[torch.Tensor], var_dim: int):
+    """Zero-pad a list of tensors to the batch max along `var_dim` and stack.
+
+    Returns (stacked, mask) where mask is (B, max_len) bool, True at real
+    (non-padded) positions along `var_dim`.
+    """
+    lengths = [img.shape[var_dim] for img in images_list]
+    max_len = max(lengths)
+    b = len(images_list)
+
+    shape = list(images_list[0].shape)
+    shape[var_dim] = max_len
+    stacked = torch.zeros(b, *shape, dtype=images_list[0].dtype)
+    mask = torch.zeros(b, max_len, dtype=torch.bool)
+
+    for i, img in enumerate(images_list):
+        n = img.shape[var_dim]
+        idx = [slice(None)] * img.ndim
+        idx[var_dim] = slice(0, n)
+        stacked[(i, *idx)] = img
+        mask[i, :n] = True
+
+    return stacked, mask
+
+
 def collate(batch):
     """Pad a batch of variable-length responses and build the mask.
 
-    Returns:
+    Stream 1's images are (T, V, 3, L, C) -- T (generated tokens) varies per
+    example and is padded/masked on axis 0. When stream 2 is enabled, each
+    item is a 4-tuple and stream 2's images are (D, V, 3, L, T) -- T is now
+    the LAST axis (D, a fixed extract.n_cols, is constant across a run and
+    never needs padding), so it gets its own pad/mask pass on that axis.
+
+    Returns (stream2 disabled):
         images: (B, T_max, V, 3, L, C)
         labels: (B,)
         mask:   (B, T_max) bool -- True at real tokens
         origins: list[str]
+
+    Returns (stream2 enabled):
+        images1, images2, labels, mask1, mask2, origins
     """
-    images_list, labels, origins = zip(*batch)
+    if len(batch[0]) == 3:
+        images_list, labels, origins = zip(*batch)
+        images, mask = _pad_stack(list(images_list), var_dim=0)
+        return (
+            images,
+            torch.tensor(labels, dtype=torch.float32),
+            mask,
+            list(origins),
+        )
 
-    t_max = max(img.shape[0] for img in images_list)
-    b = len(images_list)
-    _, v, c, h, w = images_list[0].shape
-
-    images = torch.zeros(b, t_max, v, c, h, w, dtype=images_list[0].dtype)
-    mask = torch.zeros(b, t_max, dtype=torch.bool)
-
-    for i, img in enumerate(images_list):
-        t = img.shape[0]
-        images[i, :t] = img
-        mask[i, :t] = True
+    images1_list, images2_list, labels, origins = zip(*batch)
+    images1, mask1 = _pad_stack(list(images1_list), var_dim=0)
+    # images2: (D, V, 3, L, T) -- T is the last axis (index 4).
+    images2, mask2 = _pad_stack(list(images2_list), var_dim=4)
 
     return (
-        images,
+        images1,
+        images2,
         torch.tensor(labels, dtype=torch.float32),
-        mask,
+        mask1,
+        mask2,
         list(origins),
     )
 
@@ -339,8 +412,8 @@ class ConcatQKVDataset(Dataset):
             out.extend(d.labels)
         return out
 
-    def __getitem__(self, i):
-        # Locate the source dataset this global index falls into.
+    def _locate(self, i: int) -> tuple[QKVImageDataset, int]:
+        """Which child dataset global index `i` falls into, and its local index."""
         lo, hi = 0, len(self.datasets) - 1
         while lo < hi:
             mid = (lo + hi) // 2
@@ -348,4 +421,12 @@ class ConcatQKVDataset(Dataset):
                 lo = mid + 1
             else:
                 hi = mid
-        return self.datasets[lo][i - self.offsets[lo]]
+        return self.datasets[lo], i - self.offsets[lo]
+
+    def __getitem__(self, i):
+        dataset, local_i = self._locate(i)
+        return dataset[local_i]
+
+    def _load_raw(self, i):
+        dataset, local_i = self._locate(i)
+        return dataset._load_raw(local_i)

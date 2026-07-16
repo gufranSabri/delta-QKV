@@ -62,6 +62,33 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
         )
         cfg.model.channels = ckpt_channels
 
+    # Same story for `include`: it drops images by index, so it changes the
+    # number of CNN streams just like `channels` does. Checkpoints written
+    # before this option existed carry no key -> keep every image.
+    ckpt_include = ckpt.get("include", None)
+    if ckpt_include != cfg.model.include:
+        logger.warning(
+            "checkpoint was trained with include=%r but config asks for %r; "
+            "using the CHECKPOINT's (the model's shape depends on it)",
+            ckpt_include, cfg.model.include,
+        )
+        cfg.model.include = ckpt_include
+
+    # Same story for stream2: it adds a whole second CNN stream, so the
+    # checkpoint's value wins. Checkpoints written before this option existed
+    # carry no key -> single-stream, matching their actual saved shape.
+    ckpt_stream2_enable = ckpt.get("stream2_enable", False)
+    ckpt_stream2_include = ckpt.get("stream2_include", None)
+    if ckpt_stream2_enable != cfg.model.stream2.enable or ckpt_stream2_include != cfg.model.stream2.include:
+        logger.warning(
+            "checkpoint was trained with stream2 enable=%r include=%r but config "
+            "asks for enable=%r include=%r; using the CHECKPOINT's",
+            ckpt_stream2_enable, ckpt_stream2_include,
+            cfg.model.stream2.enable, cfg.model.stream2.include,
+        )
+        cfg.model.stream2.enable = ckpt_stream2_enable
+        cfg.model.stream2.include = ckpt_stream2_include
+
     name = dataset_name or cfg.dataset.name
     name, eval_set = _resolve_eval_target(name, ckpt)
 
@@ -92,8 +119,13 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
         pin_memory=device.type == "cuda",
     )
 
-    # Number of CNN streams = number of images after regrouping, not len(views).
-    model = build_model(cfg, n_views=n_images(cfg.model.channels, len(views))).to(device)
+    # Number of CNN streams = number of images after regrouping and `include`
+    # filtering, not len(views).
+    n_streams = n_images(cfg.model.channels, len(views), cfg.model.include)
+    n_streams2 = None
+    if cfg.model.stream2.enable:
+        n_streams2 = n_images(cfg.model.channels, len(views), cfg.model.stream2.include)
+    model = build_model(cfg, n_views=n_streams, n_views2=n_streams2).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -206,13 +238,18 @@ def _save_to_results_csv(cfg: Config, dataset_name: str, metrics: dict, checkpoi
     # The model name must encode every axis that changes what the run IS, or two
     # different runs collide onto one (model, llm, metric) row and overwrite each
     # other. source/extraction_type change what was extracted; channels changes
-    # how it is regrouped for the CNNs. fusion/views round out the model.
+    # how it is regrouped for the CNNs. fusion/views round out the model. stream2
+    # adds a whole second CNN stream, so a stream2 run must not collide with an
+    # otherwise-identical single-stream one.
     source = run_extract.get("source", cfg.extract.source)
     extraction_type = run_extract.get("extraction_type", cfg.extract.extraction_type)
     channels = run_model.get("channels", cfg.model.channels)
+    stream2_enable = run_model.get("stream2", {}).get("enable", cfg.model.stream2.enable)
     model_name = (
         f"delta-QKV-{source}-{extraction_type}-{channels}-{fusion}-{''.join(views)}"
     )
+    if stream2_enable:
+        model_name += "+stream2"
 
     base, _ = base_name(dataset_name)
     dataset_col = DATASET_COLS.get(base, base)

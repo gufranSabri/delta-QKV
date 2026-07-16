@@ -181,6 +181,16 @@ def build_images(
     return torch.stack(per_view, dim=1)  # (T, V, L, C, 3)
 
 
+def format_meta(prompt: str, response: str, gold, score: float, label: int) -> str:
+    return (
+        f"prompt: {prompt}\n"
+        f"response: {response}\n"
+        f"gold: {gold}\n"
+        f"score: {score}\n"
+        f"label: {label}\n"
+    )
+
+
 def write_example(
     out_dir: Path,
     images: torch.Tensor,
@@ -196,12 +206,7 @@ def write_example(
     np.save(out_dir / "tokens.npy", images.to(save_dtype).numpy())
 
     (out_dir / "meta.txt").write_text(
-        f"prompt: {prompt}\n"
-        f"response: {response}\n"
-        f"gold: {gold}\n"
-        f"score: {score}\n"
-        f"label: {label}\n",
-        encoding="utf-8",
+        format_meta(prompt, response, gold, score, label), encoding="utf-8"
     )
 
 
@@ -433,11 +438,7 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
         rec["label"] = label
         out_dir = root / rec["dir"]
         (out_dir / "meta.txt").write_text(
-            f"prompt: {rec['prompt']}\n"
-            f"response: {rec['response']}\n"
-            f"gold: {rec['gold']}\n"
-            f"score: {score}\n"
-            f"label: {label}\n",
+            format_meta(rec["prompt"], rec["response"], rec["gold"], score, label),
             encoding="utf-8",
         )
 

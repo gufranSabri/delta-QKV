@@ -122,21 +122,13 @@ def pool_feature_axis(raw: torch.Tensor, n_cols: int, mode: str = "max") -> torc
         # l2: the norm of each chunk. Non-negative by construction, unlike max/mean.
         return chunked.norm(dim=-1)
 
-    # sdk: selective dimension keeper. Pick the n_cols dimensions with highest
-    # entropy (treating the D-dim distribution per (T,L) position as a signal).
-    # Reshape to (..., D) and compute Shannon entropy per dimension across the
-    # (...,) axes, then select the top-entropy dimensions.
-    x = raw.reshape(-1, d)                          # (T*L or broader, D)
-    # Entropy per dimension: -sum(p * log(p)) where p is the normalized absolute value.
-    # Use absolute value so both positive and negative activations contribute.
+    # abs() so both positive and negative activations contribute to entropy.
+    x = raw.reshape(-1, d)                           # (T*L or broader, D)
     x_abs = x.abs()
-    x_sum = x_abs.sum(dim=0, keepdim=True)
-    x_sum = x_sum.clamp(min=1e-8)                   # avoid division by zero
-    p = x_abs / x_sum                               # (T*L, D) normalized probabilities
-    entropy = -(p * (p.log() + 1e-8)).sum(dim=0)   # (D,) entropy per dimension
-    # Select the n_cols dimensions with highest entropy
+    p = x_abs / x_abs.sum(dim=0, keepdim=True).clamp(min=1e-8)
+    entropy = -(p * (p.log() + 1e-8)).sum(dim=0)     # (D,) entropy per dimension
     topk_indices = entropy.topk(n_cols, dim=0).indices
-    selected = raw[..., topk_indices]               # (..., n_cols)
+    selected = raw[..., topk_indices]                # (..., n_cols)
     return selected
 
 

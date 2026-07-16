@@ -26,12 +26,14 @@ from src.data.dataset import (
     _set_stats,
     collate,
     compute_stats,
+    n_channels,
     n_images,
 )
 from src.models.classifier import build_model
 from src.utils.logger import get_logger, setup_logging
 from src.utils.metrics import compute_metrics, format_metrics
 from src.utils.seed import pick_device, seed_everything
+from src.utils.snapshot import snapshot_code
 from src.extract.datasets import HAS_TEST_CORPUS, base_name
 from src.utils.splits import make_split
 
@@ -56,6 +58,9 @@ def load_source(cfg: Config, dataset_name: str, llm_alias: str, **kw) -> QKVImag
         max_tokens=cfg.extract.max_tokens,
         origin=f"{llm_alias}/{dataset_name}",
         channels=cfg.model.channels,
+        include=cfg.model.include,
+        stream2_enable=cfg.model.stream2.enable,
+        stream2_include=cfg.model.stream2.include,
         **kw,
     )
 
@@ -85,6 +90,26 @@ def build_datasets(
     return sources, test_source
 
 
+def _unpack_batch(batch, device):
+    """collate() yields a 4-tuple (stream2 off) or 6-tuple (stream2 on).
+
+    Returns (model_args, labels, origins) where model_args is the exact
+    positional-arg tuple QKVHalluDetector.forward expects.
+    """
+    if len(batch) == 4:
+        images, labels, mask, origins = batch
+        images = images.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        return (images, mask), labels.to(device, non_blocking=True), origins
+
+    images, images2, labels, mask, mask2, origins = batch
+    images = images.to(device, non_blocking=True)
+    images2 = images2.to(device, non_blocking=True)
+    mask = mask.to(device, non_blocking=True)
+    mask2 = mask2.to(device, non_blocking=True)
+    return (images, images2, mask, mask2), labels.to(device, non_blocking=True), origins
+
+
 def run_epoch(model, loader, criterion, device, optimizer=None, desc=""):
     """One pass. Trains if `optimizer` is given, else evaluates.
 
@@ -98,12 +123,10 @@ def run_epoch(model, loader, criterion, device, optimizer=None, desc=""):
     all_y, all_p, all_origins = [], [], []
 
     with torch.set_grad_enabled(training):
-        for images, labels, mask, origins in tqdm(loader, desc=desc, leave=False, ncols=100):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
+        for batch in tqdm(loader, desc=desc, leave=False, ncols=100):
+            model_args, labels, origins = _unpack_batch(batch, device)
 
-            logits = model(images, mask)
+            logits = model(*model_args)
             loss = criterion(logits, labels)
 
             if training:
@@ -135,6 +158,107 @@ def run_epoch(model, loader, criterion, device, optimizer=None, desc=""):
     return metrics, per_origin
 
 
+def _section(title: str) -> None:
+    logger.info("")
+    logger.info("--- %s %s", title, "-" * max(0, 58 - len(title)))
+
+
+def log_run_header(cfg: Config, run_dir, device, train_datasets, test_dataset) -> None:
+    """Log what this run actually IS, before anything expensive happens.
+
+    Deliberately reports DERIVED facts (how many images each stream really
+    gets, how many channels each carries, which fusion was really built), not
+    just echoed config strings: `channels`/`include` mean the image count is
+    NOT len(views), and a single image collapses fusion to IdentityFusion
+    regardless of model.fusion. Echoing the raw config hides both.
+    """
+    n_views = len(cfg.extract.views)
+    n1 = n_images(cfg.model.channels, n_views, cfg.model.include)
+    in_ch = n_channels(cfg.model.channels, n_views)
+
+    _section("run")
+    logger.info("run dir      : %s", run_dir)
+    logger.info("device       : %s", device)
+    logger.info("seed         : %d", cfg.train.seed)
+
+    _section("data")
+    logger.info("train sources: %s", train_datasets)
+    logger.info("test source  : %s", test_dataset or "(val split)")
+    logger.info("llm          : %s (%s)", cfg.llm.alias, cfg.llm.name)
+    logger.info("source       : %s / %s", cfg.extract.source, cfg.extract.extraction_type)
+    logger.info("views        : %s", cfg.extract.views)
+    logger.info("pool         : %s | boundary: %s", cfg.extract.pool, cfg.extract.boundary_mode)
+    logger.info("max_tokens   : %s | n_cols: %s | l_eff: %s",
+                cfg.extract.max_tokens, cfg.extract.n_cols, cfg.extract.l_eff)
+    logger.info("labeling     : %s", cfg.labeling.scheme)
+
+    _section("model")
+    logger.info("backbone     : %s (shared=%s, pretrained=%s)",
+                cfg.model.backbone, cfg.model.share_backbone,
+                cfg.model.pretrained_backbone if cfg.model.backbone == "resnet18" else "n/a")
+    logger.info("channels     : %s | include: %s",
+                cfg.model.channels, cfg.model.include if cfg.model.include is not None else "all")
+    # The line that actually says what the CNNs see. `same` + include=[0] means
+    # ONE image of V channels, not V images -- which "views: [Q, K, V]" implies.
+    logger.info("stream 1     : %d image(s) x %d channel(s), (L, D) spatial -> temporal encoder",
+                n1, in_ch)
+
+    if cfg.model.stream2.enable:
+        n2 = n_images(cfg.model.channels, n_views, cfg.model.stream2.include)
+        logger.info("stream 2     : %d image(s) x %d channel(s), (L, T) spatial -> masked pool  [include: %s]",
+                    n2, in_ch,
+                    cfg.model.stream2.include if cfg.model.stream2.include is not None else "all")
+        logger.info("             : stream vectors are concatenated before the head")
+    else:
+        logger.info("stream 2     : disabled")
+
+    # fusion only exists with >1 image to fuse; otherwise it is IdentityFusion.
+    fusion_desc = cfg.model.fusion if n1 > 1 else f"identity (only 1 image; {cfg.model.fusion} unused)"
+    logger.info("fusion       : %s", fusion_desc)
+    logger.info("embed_dim    : %d | fused_dim: %d | dropout: %.3g",
+                cfg.model.embed_dim, cfg.model.fused_dim, cfg.model.dropout)
+    logger.info("temporal     : conv1d x%d | bilstm hidden=%d x%d layer(s)",
+                cfg.model.conv1d_layers, cfg.model.lstm_hidden, cfg.model.lstm_layers)
+
+    _section("train")
+    logger.info("epochs       : %d | patience: %d | batch_size: %d",
+                cfg.train.epochs, cfg.train.patience, cfg.train.batch_size)
+    logger.info("lr           : %.3g | weight_decay: %.3g | backbone_lr_scale: %.3g",
+                cfg.train.lr, cfg.train.weight_decay, cfg.train.backbone_lr_scale)
+    logger.info("balance_class: %s | val_fraction: %.3g | test_fraction: %.3g",
+                cfg.train.balance_classes, cfg.train.val_fraction, cfg.train.test_fraction)
+
+
+def log_param_counts(model) -> None:
+    """Per-component parameter breakdown -- where the capacity actually is."""
+    groups = [
+        ("backbones (stream 1)", getattr(model, "backbones", None)),
+        ("backbones (stream 2)", getattr(model, "backbones2", None)),
+        ("fusion (stream 1)", getattr(model, "fusion", None)),
+        ("fusion (stream 2)", getattr(model, "fusion2", None)),
+        ("temporal encoder", getattr(model, "temporal", None)),
+        ("head", getattr(model, "head", None)),
+    ]
+    total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    for name, mod in groups:
+        if mod is None:
+            continue
+        n = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+        logger.info("  %-22s %11s  (%4.1f%%)", name, f"{n:,}", 100 * n / max(total, 1))
+    logger.info("  %-22s %11s", "TOTAL trainable", f"{total:,}")
+
+
+def log_model_repr(model) -> None:
+    """The full module tree, exactly as PyTorch sees it.
+
+    Emitted line by line rather than as one blob: the log formatter prefixes
+    every record, so a single multi-line message would leave all but the first
+    line unprefixed and misaligned.
+    """
+    for line in repr(model).splitlines():
+        logger.info("  %s", line)
+
+
 def train(
     cfg: Config,
     train_datasets: list[str],
@@ -146,13 +270,10 @@ def train(
 
     run_dir = Path(cfg.runs_root) / (run_name or default_run_name(cfg, train_datasets, test_dataset))
     run_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_code(run_dir)
     setup_logging(log_file=run_dir / "train.log")
 
-    logger.info("run dir: %s", run_dir)
-    logger.info("device: %s", device)
-    logger.info("train sources: %s | test source: %s", train_datasets, test_dataset or "(val split)")
-    logger.info("views: %s | fusion: %s | backbone: %s (shared=%s)",
-                cfg.extract.views, cfg.model.fusion, cfg.model.backbone, cfg.model.share_backbone)
+    log_run_header(cfg, run_dir, device, train_datasets, test_dataset)
 
     (run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
 
@@ -179,15 +300,21 @@ def train(
         seed=cfg.train.seed,
         cache=run_dir / "split.json",
     )
-    logger.info("train %d | val %d | heldout %d", len(train_idx), len(val_idx), len(heldout_idx))
+    logger.info("split        : train %d | val %d | heldout %d",
+                len(train_idx), len(val_idx), len(heldout_idx))
 
+    geom = getattr(full, "geometry", None) or getattr(full.datasets[0], "geometry", {})
+    logger.info("image size   : %s rows (L) x %s cols (D)",
+                geom.get("n_rows", "?"), geom.get("n_cols", "?"))
+
+    _section("normalisation (train split only)")
     # Normalisation statistics come from the TRAIN split only -- computing them
     # over val/test would leak those distributions into the input scaling.
     stats_path = run_dir / "stats.json"
     stats = compute_stats(full, train_idx)
     stats_path.write_text(json.dumps(stats, indent=2))
     for view, s in stats.items():
-        logger.info("norm %s: mean=%s std=%s",
+        logger.info("norm %-3s: mean=%s std=%s",
                     view,
                     [f"{m:+.3f}" for m in s["mean"]],
                     [f"{v:.3f}" for v in s["std"]])
@@ -213,11 +340,21 @@ def train(
     # ---- model --------------------------------------------------------
     # n_views here means "number of CNN streams", which is the number of IMAGES
     # after regrouping -- not len(extract.views). They differ under model.channels.
-    n_streams = n_images(cfg.model.channels, len(cfg.extract.views))
-    model = build_model(cfg, n_views=n_streams).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("model: %s parameters", f"{n_params:,}")
+    n_streams = n_images(cfg.model.channels, len(cfg.extract.views), cfg.model.include)
+    n_streams2 = None
+    if cfg.model.stream2.enable:
+        n_streams2 = n_images(
+            cfg.model.channels, len(cfg.extract.views), cfg.model.stream2.include
+        )
+    model = build_model(cfg, n_views=n_streams, n_views2=n_streams2).to(device)
 
+    _section("architecture")
+    log_model_repr(model)
+
+    _section("parameters")
+    log_param_counts(model)
+
+    _section("optimisation")
     # Class weighting: hallucination rates are typically far from 50/50, and an
     # unweighted BCE will happily collapse to predicting the majority class.
     pos_weight = None
@@ -247,6 +384,10 @@ def train(
         param_groups = [{"params": model.parameters(), "lr": cfg.train.lr}]
     else:
         backbone_params = list(model.backbones.parameters())
+        if cfg.model.stream2.enable:
+            # Same reasoning applies to stream 2's backbones -- they are also
+            # per-view CNNs, not part of fusion/temporal/head.
+            backbone_params += list(model.backbones2.parameters())
         backbone_ids = {id(p) for p in backbone_params}
         other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
         param_groups = [
@@ -287,6 +428,7 @@ def train(
     )
 
     # ---- loop ---------------------------------------------------------
+    _section("training")
     best_auroc, best_epoch, stale = -1.0, -1, 0
     history = []
 
@@ -318,6 +460,9 @@ def train(
                     "stats": stats,
                     "views": cfg.extract.views,
                     "channels": cfg.model.channels,
+                    "include": cfg.model.include,
+                    "stream2_enable": cfg.model.stream2.enable,
+                    "stream2_include": cfg.model.stream2.include,
                     "epoch": epoch,
                     "val_auroc": va["auroc"],
                     # So test.py can tell an in-distribution eval (must be
@@ -340,6 +485,7 @@ def train(
             break
 
     # ---- final evaluation with the BEST checkpoint ---------------------
+    _section("final evaluation")
     logger.info("loading best checkpoint (epoch %d, val AUROC %.4f)", best_epoch, best_auroc)
     ckpt = torch.load(run_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
@@ -379,7 +525,13 @@ def report_gates(model, loader, device, cfg) -> dict | None:
     model.eval()
     totals = torch.zeros(len(cfg.extract.views))
     n = 0
-    for images, _, mask, _ in loader:
+    for batch in loader:
+        # view_gates only looks at stream 1. collate() yields either
+        # (images, labels, mask, origins) or, with stream2 enabled,
+        # (images, images2, labels, mask, mask2, origins) -- mask's position
+        # differs, so pick it by the tuple's actual length.
+        images = batch[0]
+        mask = batch[2] if len(batch) == 4 else batch[3]
         g = model.view_gates(images.to(device), mask.to(device))
         if g is None:
             return None

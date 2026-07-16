@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "default.yaml"
 
 VALID_VIEWS = ("Q", "K", "V")
-VALID_BACKBONES = ("scratch_cnn", "resnet18", "scratch_vit")  # scratch_vit is a new addition
+VALID_BACKBONES = ("scratch_cnn", "resnet18")
 VALID_FUSIONS = ("gated", "concat_mlp", "bilinear", "cross_attn")
 
 #: What activation the images are built from. This is an EXTRACTION-time choice --
@@ -98,11 +98,33 @@ class LabelingConfig:
 
 
 @dataclass
+class Stream2Config:
+    # Stream 2 transposes each (T, L, D) image to (D, L, T) before the same
+    # channels/regroup pipeline stream 1 uses -- T (generated tokens) becomes
+    # a spatial axis instead of the sequence axis, so the model can find
+    # "this happens over these tokens" structure directly inside a CNN. D
+    # (a fixed extract.n_cols per run) takes T's old role as the axis folded
+    # into the batch. Off by default: existing configs/checkpoints are
+    # single-stream and unaffected.
+    enable: bool = False
+    # Same semantics as model.include, but selects among stream 2's own
+    # regrouped images (same `channels` mode, independent selection).
+    include: list[int] | None = None
+
+
+@dataclass
 class ModelConfig:
     backbone: str = "scratch_cnn"
     # How the extracted views/channels are regrouped into images. See
     # VALID_CHANNEL_MODES. Never requires re-extraction.
     channels: str = "default"
+    # Which of the regrouped images to actually feed the model, by index --
+    # applied as the LAST step in QKVImageDataset.__getitem__, after `channels`
+    # has decided how many images there are. `null` (the default) keeps all of
+    # them. E.g. under channels=same (3 images: raw, ch1, ch2), include=[0, 2]
+    # drops the middle image and leaves the model with 2 CNN streams.
+    include: list[int] | None = None
+    stream2: Stream2Config = field(default_factory=Stream2Config)
     share_backbone: bool = False
     embed_dim: int = 128       # E: per-view CNN output
     fusion: str = "gated"
@@ -235,6 +257,33 @@ class Config:
                 f"model.channels='same' stacks Q/K/V on the channel axis and "
                 f"needs all three views, but extract.views={e.views}"
             )
+        def _check_include(include: list[int] | None, field_name: str) -> None:
+            if include is None:
+                return
+            from src.data.dataset import n_images
+
+            n_avail = n_images(m.channels, len(e.views))
+            if not include:
+                raise ValueError(f"{field_name} must not be empty")
+            if len(set(include)) != len(include):
+                raise ValueError(f"{field_name} has duplicates: {include}")
+            bad = [i for i in include if not 0 <= i < n_avail]
+            if bad:
+                raise ValueError(
+                    f"{field_name} {bad} out of range for model.channels={m.channels!r} "
+                    f"with extract.views={e.views} ({n_avail} images available)"
+                )
+
+        _check_include(m.include, "model.include")
+        _check_include(m.stream2.include, "model.stream2.include")
+
+        if m.stream2.enable and m.backbone == "resnet18":
+            raise ValueError(
+                "model.stream2.enable=true is not supported with backbone=resnet18: "
+                "torchvision's resnet18 internals aren't decomposable the way "
+                "scratch_cnn's are, which stream 2's masked pooling needs. "
+                "Use backbone=scratch_cnn, or disable stream2."
+            )
         if m.fusion not in VALID_FUSIONS:
             raise ValueError(f"model.fusion must be one of {VALID_FUSIONS}")
         if la.scheme not in VALID_SCHEMES:
@@ -286,7 +335,7 @@ _SECTIONS = {
 def _build(raw: dict) -> Config:
     kwargs: dict[str, Any] = {}
     for name, cls in _SECTIONS.items():
-        section = raw.get(name) or {}
+        section = dict(raw.get(name) or {})
         if not isinstance(section, dict):
             raise ValueError(f"config section '{name}' must be a mapping")
         known = {f for f in cls.__dataclass_fields__}
@@ -295,6 +344,11 @@ def _build(raw: dict) -> Config:
             raise ValueError(
                 f"unknown key(s) in '{name}': {sorted(unknown)}. Valid: {sorted(known)}"
             )
+        # model.stream2 is a nested dataclass; YAML gives it to us as a plain
+        # dict, which must be converted explicitly or it would silently stick
+        # around as a dict and break attribute access (cfg.model.stream2.enable).
+        if cls is ModelConfig and isinstance(section.get("stream2"), dict):
+            section["stream2"] = Stream2Config(**section["stream2"])
         kwargs[name] = cls(**section)
 
     for top in ("data_root", "runs_root"):

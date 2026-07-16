@@ -13,9 +13,19 @@ dataset:
   prompt_template: "Answer the question concisely. Q: {question} A:"
 
 extract:
-  views: [Q, K, V]            # subset for ablations, e.g. [V]. Fusion adapts.
-  pool: max                   # max | mean | l2  -- how D is reduced to n_cols
-  boundary_mode: zero         # zero | replicate | wrap  (see tensor_ops.py)
+  # WHAT to capture and HOW to channel it. Both are extraction-time choices that
+  # change what lands on disk, so they partition the data folder:
+  #   data/{source}/{extraction_type}/{dataset}/{llm_alias}/
+  source: qkv                 # qkv (Q/K/V projections) | hs (hidden states)
+  extraction_type: transforms      # delta (raw,dprev,dnext) | transforms (raw,DWT,FFT)
+  views: [Q,K,V]                  # subset for ablations, e.g. [H]. Fusion adapts.
+                              # source=hs is a single stream -> views defaults to [H].
+  pool: mean                   # max | mean | l2 | sdk  -- how D is reduced to n_cols
+                              # max: peak value per chunk
+                              # mean: average value per chunk
+                              # l2: L2 norm per chunk
+                              # sdk: selective dimension keeper (picks top-entropy dims)
+  boundary_mode: wrap         # zero | replicate | wrap (delta only; see tensor_ops.py)
   dtype: float16
   max_tokens: 100
   n_cols: null                # null -> use the model's layer count => SQUARE image
@@ -27,26 +37,45 @@ labeling:
   bleurt_checkpoint: models/BLEURT-20-D12
 
 model:
-  backbone: scratch_cnn       # scratch_cnn | resnet18
+  backbone: scratch_cnn       # scratch_cnn | resnet18 | scratch_vit
+  # How the extracted (V views x 3 channels) tensor is regrouped into images.
+  # Pure re-slicing -- no mode needs re-extraction. (ch0,ch1,ch2) are the three
+  # extraction channels: (raw,dprev,dnext) for delta, (raw,DWT,FFT) for transforms.
+  #   default     V images, 3ch each: view v -> (ch0, ch1, ch2)
+  #   first_only  1 image,  Vch: the raw channel of each view -- others dropped
+  #   same        3 images, Vch each, grouped BY CHANNEL:
+  #               (ch0 of all views), (ch1 of all views), (ch2 of all views)
+  channels: same                # default | first_only | same
   share_backbone: false       # false => one CNN per view (Q, K, V untied)
-  embed_dim: 128              # E: per-view CNN output
-  fusion: gated               # gated | concat_mlp | bilinear | cross_attn
-  fused_dim: 128              # F: fusion output
+  embed_dim: 256              # E: per-view CNN output
+  fusion: concat_mlp               # gated | concat_mlp | bilinear | cross_attn
+  fused_dim: 256              # F: fusion output
   conv1d_layers: 2
-  lstm_hidden: 128
+  lstm_hidden: 256
   lstm_layers: 1
   dropout: 0.3
   pretrained_backbone: true   # only used by resnet18
 
 train:
-  batch_size: 32
-  lr: 0.001
+  batch_size: 8
+  lr: 0.0001
   weight_decay: 0.0001
+  # Pretrained resnet18 backbone trains at lr * this. A gentler LR keeps the
+  # random head from wrecking the ImageNet features early. Set to 1.0 for
+  # scratch_cnn / pretrained_backbone:false (nothing pretrained to protect).
+  backbone_lr_scale: 0.1
+  # Linear LR decay: flat for the first lr_decay_start epochs, then ramp linearly
+  # down to lr_final_scale x the initial LR by `epochs` (0.0 => decays to zero).
+  lr_decay_start: 5
+  lr_final_scale: 0.0
   epochs: 30
   patience: 8
-  seed: 0
+  seed: 42                    # ACT-ViT's RANDOM_STATE; HalluShift uses 42 too
   num_workers: 4
   val_fraction: 0.2
+  # Only applies to datasets with no separate held-out corpus (TruthfulQA).
+  # The rest evaluate on a `<name>_test` corpus, so nothing is carved out.
+  test_fraction: 0.2
   balance_classes: true
 
 data_root: data

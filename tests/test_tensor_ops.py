@@ -8,6 +8,7 @@ import torch
 
 from src.extract.tensor_ops import (
     add_delta_channels,
+    add_transform_channels,
     build_view_image,
     pool_feature_axis,
     pool_layer_axis,
@@ -215,6 +216,51 @@ def test_build_view_image_upcasts_fp16_input():
     raw = torch.randn(2, 4, 8, dtype=torch.float16)
     img = build_view_image(raw, n_cols=4)
     assert img.dtype == torch.float32
+
+
+# --------------------------------------------------------------------------
+# add_transform_channels -- (raw, DWT, FFT) along the layer axis
+# --------------------------------------------------------------------------
+
+def test_transform_channels_shape_and_raw_channel_is_identity():
+    pooled = torch.randn(3, 8, 5)
+    img = add_transform_channels(pooled)
+    assert img.shape == (3, 8, 5, 3)
+    # Channel 0 must be the raw pooled activation, untouched.
+    assert torch.equal(img[..., 0], pooled)
+
+
+def test_transform_channels_are_nonnegative_magnitudes():
+    pooled = torch.randn(2, 16, 4)
+    img = add_transform_channels(pooled)
+    # DWT and FFT channels are magnitudes -> non-negative everywhere.
+    assert (img[..., 1] >= 0).all()
+    assert (img[..., 2] >= 0).all()
+
+
+def test_transform_channels_flag_a_localised_layer_jump():
+    """A signal flat except for a jump at one layer should light up the DWT
+    detail channel LOCALLY at that layer, not uniformly."""
+    T, L, C = 1, 16, 1
+    pooled = torch.zeros(T, L, C)
+    pooled[0, 8, 0] = 10.0            # a single-layer spike
+    img = add_transform_channels(pooled)
+    dwt = img[0, :, 0, 1]
+    # The largest DWT response should sit at/near the jump (layers 7-8), not far.
+    peak = int(dwt.argmax())
+    assert 7 <= peak <= 8
+
+
+def test_build_view_image_transforms_matches_add_transform():
+    raw = torch.randn(3, 6, 12)
+    img = build_view_image(raw, n_cols=6, extraction_type="transforms", pool_mode="max")
+    manual = add_transform_channels(pool_feature_axis(raw.float(), n_cols=6, mode="max"))
+    assert torch.allclose(img, manual)
+
+
+def test_build_view_image_rejects_unknown_extraction_type():
+    with pytest.raises(ValueError, match="extraction_type"):
+        build_view_image(torch.randn(2, 4, 8), n_cols=4, extraction_type="nonsense")
 
 
 # --------------------------------------------------------------------------

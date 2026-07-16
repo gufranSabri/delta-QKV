@@ -65,6 +65,10 @@ import torch.nn as nn
 VIEWS = ("Q", "K", "V")
 _PROJ_FOR_VIEW = {"Q": "q_proj", "K": "k_proj", "V": "v_proj"}
 
+# The lone "view" name for the hidden-state (residual-stream) source. Hidden
+# states are a single stream, not a Q/K/V triple, so they get one view.
+HS_VIEW = "H"
+
 
 @dataclass
 class ModelGeometry:
@@ -85,6 +89,10 @@ class ModelGeometry:
         return self.n_kv_heads * self.head_dim
 
     def feature_dim(self, view: str) -> int:
+        # H is the hidden state (residual stream): its width is hidden_size, not
+        # a projection dim. Q is d_q; K/V are the (GQA-narrower) d_kv.
+        if view == HS_VIEW:
+            return self.hidden_size
         return self.d_q if view == "Q" else self.d_kv
 
     def __str__(self) -> str:
@@ -350,3 +358,74 @@ def capture_qkv(
             )
 
     return qkv, torch.tensor(generated, dtype=torch.long, device=device)
+
+
+@torch.no_grad()
+def capture_hidden(
+    model,
+    input_ids: torch.Tensor,
+    max_new_tokens: int = 100,
+    eos_token_id=None,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Greedy-generate and capture per-layer HIDDEN STATES for generated tokens.
+
+    The hidden-state analogue of `capture_qkv`. Hidden states (the residual
+    stream after each decoder layer) come for free via output_hidden_states, so
+    no forward hooks are needed -- we just read them off each decode step.
+
+    Returns:
+        (hidden, generated_ids) where hidden["H"] is (T, L, D_hidden), matching
+        capture_qkv's contract so the rest of the pipeline is source-agnostic.
+
+    `output_hidden_states` yields L+1 tensors: index 0 is the embedding output
+    (pre-layer-0), indices 1..L are the outputs of each decoder layer. We keep
+    1..L so layer l corresponds to "the residual stream AFTER layer l" -- the
+    same L-length layer axis the Q/K/V path produces.
+    """
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise ValueError(f"expected input_ids (1, prompt_len), got {tuple(input_ids.shape)}")
+
+    device = input_ids.device
+    if eos_token_id is None:
+        eos_token_id = model.config.eos_token_id
+    eos_ids = set()
+    if eos_token_id is not None:
+        eos_ids = set(eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id])
+
+    # ---- PREFILL: consume the prompt. Its hidden states are the PROMPT's, so
+    # they are discarded; we only keep the argmax to seed decoding. ----
+    out = model(input_ids=input_ids, use_cache=True, output_hidden_states=True)
+    past = out.past_key_values
+    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+    # ---- DECODE: one token at a time; keep each step's per-layer hidden state.
+    generated: list[int] = []
+    per_step: list[torch.Tensor] = []   # each (L, D_hidden) for one generated token
+
+    for _ in range(max_new_tokens):
+        token_id = int(next_token.item())
+        if token_id in eos_ids:
+            break
+        generated.append(token_id)
+
+        out = model(
+            input_ids=next_token,
+            past_key_values=past,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        past = out.past_key_values
+        # hidden_states: tuple of (1, 1, D_hidden), length L+1. Drop the embedding
+        # (index 0); stack layers 1..L into (L, D_hidden) for this token.
+        layers = out.hidden_states[1:]
+        step = torch.stack(
+            [h[0, -1].detach().to("cpu", torch.float32) for h in layers], dim=0
+        )
+        per_step.append(step)
+        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+    if not generated:
+        return {HS_VIEW: torch.empty(0)}, torch.empty(0, dtype=torch.long)
+
+    hidden = torch.stack(per_step, dim=0)           # (T, L, D_hidden)
+    return {HS_VIEW: hidden}, torch.tensor(generated, dtype=torch.long, device=device)

@@ -306,6 +306,51 @@ def test_resnet18_backbone_runs():
     assert model(images, mask).shape == (B,)
 
 
+def test_resnet18_random_init_keeps_native_resolution():
+    """With random weights there is no pretrained stem to protect, so the stem is
+    adapted for small images and the input is NOT upscaled (49x the compute for
+    no information gain)."""
+    from src.models.backbones import ResNet18Adapted
+
+    net = ResNet18Adapted(embed_dim=16, pretrained=False)
+    assert net.resize_to is None
+    assert net.net.conv1.kernel_size == (3, 3)
+    assert net.net.conv1.stride == (1, 1)
+    assert isinstance(net.net.maxpool, torch.nn.Identity)
+
+
+def test_resnet18_pretrained_is_unmodified_and_resizes_input():
+    """The pretrained network must be used AS-IS: resize the input to 224x224
+    rather than rebuilding conv1 / deleting the maxpool, which would discard the
+    very weights the checkpoint was loaded for.
+
+    Downloads the torchvision checkpoint on first run.
+    """
+    from torchvision.models import ResNet18_Weights, resnet18
+
+    from src.models.backbones import ResNet18Adapted
+
+    net = ResNet18Adapted(embed_dim=16, pretrained=True)
+
+    # The stem is the stock ImageNet stem, untouched.
+    assert net.resize_to == 224
+    assert net.net.conv1.kernel_size == (7, 7)
+    assert net.net.conv1.stride == (2, 2)
+    assert isinstance(net.net.maxpool, torch.nn.MaxPool2d)
+
+    # And the weights really are the pretrained ones, not a crop or a re-init.
+    ref = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    assert torch.equal(net.net.conv1.weight, ref.conv1.weight)
+    assert torch.equal(net.net.layer4[1].conv2.weight, ref.layer4[1].conv2.weight)
+
+    # A 32x32 activation image still produces an embedding, and gradients reach
+    # the stem through the resize.
+    out = net(torch.randn(2, 3, 32, 32))
+    assert out.shape == (2, 16)
+    out.sum().backward()
+    assert net.net.conv1.weight.grad.abs().sum() > 0
+
+
 def test_view_i_is_routed_to_backbone_i():
     """Shape tests pass even if the view axis is transposed. This does not.
 
@@ -364,3 +409,95 @@ def test_temporal_encoder_rejects_an_empty_sequence():
     mask[1] = False                              # row 1 has no real tokens
     with pytest.raises(ValueError, match="all-False mask"):
         enc(torch.randn(2, 4, E), mask)
+
+
+# --------------------------------------------------------------------------
+# temporal cross-attention adapter (ScratchCNN)
+# --------------------------------------------------------------------------
+
+def test_adapter_off_leaves_backbone_unchanged():
+    """The flag defaults off; with it off the backbone must be byte-for-byte the
+    plain ScratchCNN -- same params, no adapter modules."""
+    from src.models.backbones import ScratchCNN
+
+    plain = ScratchCNN(embed_dim=E, in_ch=3)
+    assert all(a is None for a in plain.adapters)
+    n_plain = sum(p.numel() for p in plain.parameters())
+
+    with_flag_off = ScratchCNN(embed_dim=E, in_ch=3, use_temporal_adapter=False)
+    assert sum(p.numel() for p in with_flag_off.parameters()) == n_plain
+
+    # And it still runs without a token count (no adapter needs it).
+    out = plain(torch.randn(4, 3, L, C))
+    assert out.shape == (4, E)
+
+
+def test_adapter_on_runs_and_is_a_moderate_param_increase():
+    cfg = make_cfg(use_temporal_adapter=True)
+    model = build_model(cfg, n_views=3).eval()
+    images, mask = make_batch()
+    with torch.no_grad():
+        out = model(images, mask)
+    assert out.shape == (B,)
+    assert torch.isfinite(out).all()
+
+    # Every backbone must now carry three live adapters.
+    for bb in model.backbones:
+        assert sum(a is not None for a in bb.adapters) == 3
+
+    # "Moderate" shrink: the adapter must not blow the backbone up unboundedly.
+    plain = build_model(make_cfg(), n_views=3)
+    n_plain = sum(p.numel() for p in plain.backbones.parameters())
+    n_adpt = sum(p.numel() for p in model.backbones.parameters())
+    assert n_adpt < 3 * n_plain, f"adapter too large: {n_adpt} vs {n_plain}"
+
+
+@pytest.mark.parametrize("share_backbone", [False, True])
+def test_adapter_is_padding_invariant(share_backbone):
+    """The whole reason the mask is threaded into the backbone: cross-token
+    attention must never let padded tokens influence a real token's features."""
+    cfg = make_cfg(use_temporal_adapter=True, share_backbone=share_backbone)
+    model = build_model(cfg, n_views=3).eval()
+
+    images, mask = make_batch()
+    with torch.no_grad():
+        a = model(images, mask)
+        noisy = images.clone()
+        noisy[1, 3:] = 987.0        # garbage ONLY in padded tokens of example 1
+        b = model(noisy, mask)
+
+    torch.testing.assert_close(
+        a, b, msg="padded tokens leaked through the temporal adapter"
+    )
+
+
+@pytest.mark.parametrize("share_backbone", [False, True])
+def test_adapter_actually_mixes_across_tokens(share_backbone):
+    """The adapter's point is cross-token mixing: changing a REAL token must be
+    able to shift another token's embedding. Without cross-attention it couldn't."""
+    cfg = make_cfg(use_temporal_adapter=True, share_backbone=share_backbone)
+    model = build_model(cfg, n_views=3).eval()
+
+    images = torch.randn(1, 4, 3, 3, L, C)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    with torch.no_grad():
+        base = model.encode_tokens(images, mask)     # (1, 4, F)
+        changed = images.clone()
+        changed[0, 0] = torch.randn_like(changed[0, 0])   # perturb token 0 only
+        after = model.encode_tokens(changed, mask)
+
+    # Token 3's embedding should move even though only token 0 changed.
+    assert not torch.allclose(base[0, 3], after[0, 3]), "no cross-token mixing"
+
+
+def test_adapter_backward_reaches_the_adapter():
+    cfg = make_cfg(use_temporal_adapter=True)
+    model = build_model(cfg, n_views=3)
+    images, mask = make_batch()
+
+    model(images, mask).sum().backward()
+
+    for i, bb in enumerate(model.backbones):
+        # down_proj is the adapter's first learnable layer; it must get gradient.
+        grad = bb.adapters[0].down_proj.weight.grad
+        assert grad is not None and grad.abs().sum() > 0, f"adapter {i} got no grad"

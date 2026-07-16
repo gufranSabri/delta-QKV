@@ -1,13 +1,3 @@
-# Generated artifacts.
-#
-# NOTE: these patterns are ANCHORED with a leading slash so they match only at the
-# repo root. An unanchored `data/` or `models/` matches a directory of that name at
-# ANY depth, which would also swallow src/data/ and src/models/ and silently
-# untrack the source tree.
-#
-# Comments must be on their own line -- git does not support trailing comments, so
-# `/data/   # features` would be read as a pattern containing spaces and a hash.
-
 # extracted features (huge)
 /data/
 # training outputs
@@ -16,6 +6,8 @@
 /models/
 # generated experiment scripts
 /scripts/generated/
+
+/docs/
 
 # Python
 __pycache__/

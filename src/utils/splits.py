@@ -16,42 +16,68 @@ logger = get_logger(__name__)
 def make_split(
     labels: list[int],
     val_fraction: float = 0.2,
+    test_fraction: float = 0.0,
     seed: int = 0,
     cache: Path | None = None,
-) -> tuple[list[int], list[int]]:
-    """Stratified split of indices into (train, val).
+) -> tuple[list[int], list[int], list[int]]:
+    """Stratified split of indices into (train, val, test).
 
     Stratified because hallucination rates are often far from 50/50; a random
     split could hand the validation set a wildly different positive rate and make
     val AUROC incomparable to train.
 
+    `test_fraction=0` yields an empty test list, which is the right thing for the
+    datasets that ship a *separate* held-out corpus (see datasets.SPLIT_SOURCES):
+    there, the test set is a different corpus entirely, not a slice of this one.
+    It is non-zero only for datasets with a single upstream split (TruthfulQA),
+    where the only honest test set is one we carve out ourselves.
+
     Persisted to `cache` so that repeated runs (and the model-selection decisions
     they drive) all see the same split.
     """
+    key = {"n": len(labels), "seed": seed,
+           "val_fraction": val_fraction, "test_fraction": test_fraction}
+
     if cache is not None and cache.exists():
         data = json.loads(cache.read_text())
-        if data.get("n") == len(labels) and data.get("seed") == seed:
+        # Compare the full parameterisation, not just (n, seed): a run that
+        # changes only test_fraction must not silently reuse a two-way split.
+        if all(data.get(k) == v for k, v in key.items()):
             logger.info("reusing cached split from %s", cache)
-            return data["train"], data["val"]
-        logger.warning("cached split at %s is stale (n or seed changed); rebuilding", cache)
+            return data["train"], data["val"], data.get("test", [])
+        logger.warning("cached split at %s is stale; rebuilding", cache)
 
     idx = np.arange(len(labels))
     y = np.asarray(labels)
 
-    stratify = y if len(np.unique(y)) > 1 else None
-    if stratify is None:
+    def _stratify(subset_y):
+        if len(np.unique(subset_y)) > 1:
+            return subset_y
         logger.warning("only one class present; falling back to an unstratified split")
+        return None
 
-    train, val = train_test_split(
-        idx, test_size=val_fraction, random_state=seed, stratify=stratify
+    test: list[int] = []
+    rest = idx
+    if test_fraction > 0:
+        rest, test_arr = train_test_split(
+            idx, test_size=test_fraction, random_state=seed, stratify=_stratify(y)
+        )
+        test = sorted(test_arr.tolist())
+
+    # val_fraction is expressed w.r.t. the FULL dataset, so rescale it against
+    # what's left after the test slice -- otherwise carving out a test set would
+    # silently shrink val too.
+    rel_val = val_fraction / (1.0 - test_fraction) if test_fraction > 0 else val_fraction
+    train_arr, val_arr = train_test_split(
+        rest, test_size=rel_val, random_state=seed, stratify=_stratify(y[rest])
     )
-    train, val = sorted(train.tolist()), sorted(val.tolist())
+    train, val = sorted(train_arr.tolist()), sorted(val_arr.tolist())
 
     if cache is not None:
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(
-            json.dumps({"n": len(labels), "seed": seed, "train": train, "val": val})
+            json.dumps({**key, "train": train, "val": val, "test": test})
         )
         logger.info("saved split to %s", cache)
 
-    return train, val
+    return train, val, test

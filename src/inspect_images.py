@@ -43,10 +43,18 @@ def inspect(cfg: Config, idx: int = 0, n_tokens: int = 4, out: str | None = None
     print(f"  images:   {images.shape}  (T, views, layers, cols, channels)")
     print(f"  views:    {views}\n")
 
+    # Channel meaning depends on how extraction built them.
+    extraction_type = geometry.get("extraction_type", "delta")
+    if extraction_type == "transforms":
+        chan_names = ["raw", "dwt_haar", "dwt_sym3"]
+        signed = False        # DWT channels are non-negative magnitudes
+    else:
+        chan_names = ["raw", "d_prev", "d_next"]
+        signed = True         # delta channels are signed
+
     # Per-view, per-channel magnitude. Wildly different scales across views is
     # exactly why normalisation is per-view.
     print("  magnitude by view/channel (mean |x|):")
-    chan_names = ["raw", "d_prev", "d_next"]
     for v, name in enumerate(views):
         mags = [np.abs(images[:, v, :, :, c]).mean() for c in range(3)]
         print(f"    {name}: " + "  ".join(
@@ -91,9 +99,10 @@ def inspect(cfg: Config, idx: int = 0, n_tokens: int = 4, out: str | None = None
             for c, cname in enumerate(chan_names):
                 ax = axes[v * 3 + c][t]
                 img = images[t, v, :, :, c]
-                # Symmetric colour scale for the signed delta channels, so zero
-                # reads as neutral and the sign is visible.
-                if c == 0:
+                # Delta channels are signed: a symmetric coolwarm scale makes zero
+                # read as neutral and the sign visible. Transform channels (DWT/
+                # FFT) are non-negative magnitudes, so viridis reads them better.
+                if c == 0 or not signed:
                     ax.imshow(img, aspect="auto", cmap="viridis")
                 else:
                     lim = np.abs(img).max() or 1.0

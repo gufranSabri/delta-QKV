@@ -224,7 +224,7 @@ def test_stats_are_computed_from_train_split_only(cfg_and_data, tmp_path):
 
     root = tmp_path / "data" / "fakeds" / "fake_llm"
     ds = QKVImageDataset(root, views=VIEWS)
-    train_idx, val_idx = make_split(ds.labels, val_fraction=0.25, seed=0)
+    train_idx, val_idx, _ = make_split(ds.labels, val_fraction=0.25, seed=0)
 
     from_train = compute_stats(ds, train_idx)
     from_all = compute_stats(ds, list(range(len(ds))))

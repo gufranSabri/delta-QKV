@@ -250,28 +250,62 @@ def test_concat_rejects_mismatched_image_sizes(tmp_path):
 
 def test_split_is_stratified_and_disjoint():
     labels = [0] * 80 + [1] * 20        # 20% positive
-    train, val = make_split(labels, val_fraction=0.2, seed=0)
+    train, val, test = make_split(labels, val_fraction=0.2, seed=0)
 
     assert len(train) + len(val) == 100
+    assert test == [], "no test slice was requested"
     assert not set(train) & set(val), "train and val overlap"
 
     val_rate = sum(labels[i] for i in val) / len(val)
     assert abs(val_rate - 0.2) < 0.06, "stratification did not preserve class balance"
 
 
+def test_three_way_split_is_disjoint_and_stratified():
+    """The test slice must never intersect train -- that was the original bug:
+    same-dataset 'test' metrics were being computed over the training rows."""
+    labels = [0] * 80 + [1] * 20
+    train, val, test = make_split(labels, val_fraction=0.2, test_fraction=0.2, seed=42)
+
+    assert len(train) + len(val) + len(test) == 100
+    assert not set(train) & set(test), "TRAIN/TEST OVERLAP -- test metrics would be inflated"
+    assert not set(val) & set(test), "val and test overlap"
+    assert not set(train) & set(val), "train and val overlap"
+
+    # val_fraction is w.r.t. the whole dataset, so carving out a test slice must
+    # not silently shrink val as a side effect.
+    assert len(val) == 20 and len(test) == 20
+
+    test_rate = sum(labels[i] for i in test) / len(test)
+    assert abs(test_rate - 0.2) < 0.06, "test slice lost the class balance"
+
+
 def test_split_is_cached_and_reused(tmp_path):
     labels = [0, 1] * 25
     cache = tmp_path / "split.json"
 
-    t1, v1 = make_split(labels, seed=0, cache=cache)
+    t1, v1, s1 = make_split(labels, seed=0, cache=cache)
     assert cache.exists()
-    t2, v2 = make_split(labels, seed=0, cache=cache)
-    assert t1 == t2 and v1 == v2
+    t2, v2, s2 = make_split(labels, seed=0, cache=cache)
+    assert t1 == t2 and v1 == v2 and s1 == s2
 
 
 def test_split_cache_is_invalidated_when_data_changes(tmp_path):
     cache = tmp_path / "split.json"
     make_split([0, 1] * 25, seed=0, cache=cache)
     # A different dataset size must NOT silently reuse the stale split.
-    t, v = make_split([0, 1] * 50, seed=0, cache=cache)
+    t, v, _ = make_split([0, 1] * 50, seed=0, cache=cache)
     assert len(t) + len(v) == 100
+
+
+def test_split_cache_is_invalidated_when_test_fraction_changes(tmp_path):
+    """A cached two-way split must not be reused once a test slice is asked for,
+    or the run would train on rows it later reports as held-out."""
+    labels = [0, 1] * 50
+    cache = tmp_path / "split.json"
+
+    make_split(labels, val_fraction=0.2, test_fraction=0.0, seed=42, cache=cache)
+    train, val, test = make_split(
+        labels, val_fraction=0.2, test_fraction=0.2, seed=42, cache=cache
+    )
+    assert len(test) == 20, "stale two-way split was reused"
+    assert not set(train) & set(test)

@@ -32,7 +32,9 @@ class QKVImageDataset(Dataset):
         stats: dict | None = None,
         max_tokens: int | None = None,
         origin: str | None = None,
+        channels: str = "default",
     ):
+        self.channels = channels
         self.root = Path(root)
         manifest = self.root / "manifest.jsonl"
         if not manifest.exists():
@@ -98,9 +100,74 @@ class QKVImageDataset(Dataset):
             images = normalize(images, self.stats, self.views)
 
         # (T, V, L, C, 3) -> (T, V, 3, L, C): channels into conv position.
-        images = images.permute(0, 1, 4, 2, 3).contiguous()
+        images = images.permute(0, 1, 4, 2, 3)
+
+        images = regroup_channels(images, self.channels).contiguous()
 
         return images, float(rec["label"]), self.origin
+
+
+def n_images(mode: str, n_views: int) -> int:
+    """How many images (i.e. CNN streams) `mode` produces from `n_views` views.
+
+    This is what the model must be built for -- NOT len(extract.views), which is
+    only the image count in `default` mode. `n_views` is 1 for the hidden-state
+    source and up to 3 (Q/K/V) for the qkv source.
+    """
+    if mode == "default":
+        return n_views        # one image per view
+    if mode == "first_only":
+        return 1              # one image; the views became its channels
+    if mode == "same":
+        return 3              # one image per channel-type (raw, ch1, ch2)
+    raise ValueError(f"unknown model.channels mode {mode!r}")
+
+
+def n_channels(mode: str, n_views: int) -> int:
+    """How many channels each image produced by `mode` carries."""
+    if mode == "default":
+        return 3              # the three extraction channels (raw + two others)
+    if mode == "first_only":
+        return n_views        # first channel of each view, stacked
+    if mode == "same":
+        return n_views        # views stacked onto the channel axis, per channel-type
+    raise ValueError(f"unknown model.channels mode {mode!r}")
+
+
+def regroup_channels(images: torch.Tensor, mode: str) -> torch.Tensor:
+    """Regroup the (view, channel) axes into the images the CNNs consume.
+
+    images: (T, V, 3, L, C) -- V views, each a 3-channel image. The three
+    channels are (raw, delta-prev, delta-next) under extraction_type=delta, or
+    (raw, DWT, FFT) under extraction_type=transforms; the regrouping is identical
+    either way, since it only cares about channel POSITION, not meaning.
+    Returns (T, V', C', L, C): V' images of C' channels each.
+
+    This is pure re-slicing of what extraction already wrote -- no mode needs a
+    re-extract. Normalisation has ALREADY run, per view and per channel, on the
+    original layout; that ordering is load-bearing, because different views have
+    very different magnitudes and stacking them onto one channel axis
+    unnormalised would let the largest-scale view dominate the shared conv filters.
+
+      default     (T, V, 3, L, C) unchanged -- one image per view.
+      first_only  (T, 1, V, L, C) -- ONE image whose channels are the FIRST (raw)
+                  channel of each view. The other two channels are dropped.
+      same        (T, 3, V, L, C) -- transposed: image k holds channel k of every
+                  view, i.e. (raw of all views), (ch1 of all), (ch2 of all).
+    """
+    if mode == "default":
+        return images
+
+    if mode == "first_only":
+        # Channel 0 (raw) of every view -> one image, one channel per view.
+        raw = images[:, :, 0]                      # (T, V, L, C)
+        return raw.unsqueeze(1)                    # (T, 1, V, L, C)
+
+    if mode == "same":
+        # Swap the view and channel axes: image k = channel k across all views.
+        return images.transpose(1, 2)              # (T, 3, V, L, C)
+
+    raise ValueError(f"unknown model.channels mode {mode!r}")
 
 
 def normalize(images: torch.Tensor, stats: dict, views: list[str]) -> torch.Tensor:

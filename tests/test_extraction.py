@@ -384,6 +384,133 @@ def test_extraction_is_resumable(tmp_path, tiny_model):
     assert len(lines) == 3, "resume wiped the manifest"
 
 
+def test_hidden_state_transforms_extraction_end_to_end(tmp_path):
+    """source=hs + extraction_type=transforms: one view (H), (raw,DWT,FFT) channels,
+    and its own data folder. Exercises the full extract -> load -> model path."""
+    from unittest.mock import patch
+
+    from transformers import AutoTokenizer
+
+    from src.data.dataset import QKVImageDataset, collate, n_images
+    from src.extract.datasets import Example
+    from src.extract.run_extraction import run_extraction
+    from src.models.classifier import build_model
+
+    try:
+        tok = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    except Exception:
+        pytest.skip("tokenizer unavailable (offline)")
+
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        vocab_size=32000, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=4, num_attention_heads=8, num_key_value_heads=4,
+        head_dim=8, max_position_embeddings=128,
+    )).eval()
+
+    cfg = Config()
+    cfg.data_root = str(tmp_path)
+    cfg.llm.alias = "tiny"
+    cfg.dataset.name = "triviaqa"
+    cfg.dataset.max_new_tokens = 6
+    cfg.extract.max_tokens = 6
+    cfg.extract.source = "hs"
+    cfg.extract.views = ["H"]              # single hidden-state stream
+    cfg.extract.extraction_type = "transforms"
+    cfg.extract.n_cols = 4                 # hidden_size=64 divisible by 4
+    cfg.model.channels = "default"         # 1 view -> 1 image, 3 channels
+    cfg.model.embed_dim = 16
+    cfg.model.fused_dim = 16
+    cfg.model.lstm_hidden = 8
+
+    examples = [Example(prompt=f"Q{i}", gold=["x"], idx=i) for i in range(3)]
+
+    with patch("src.extract.run_extraction.load_llm", return_value=(model, tok)), \
+         patch("src.extract.run_extraction.load_examples", return_value=examples):
+        run_extraction(cfg)
+
+    root = cfg.example_dir()
+    # The path must carry source + extraction_type so it never collides with qkv.
+    assert root.as_posix().endswith("hs/transforms/triviaqa/tiny")
+
+    geom = json.loads((root / "geometry.json").read_text())
+    assert geom["source"] == "hs"
+    assert geom["extraction_type"] == "transforms"
+    assert geom["views"] == ["H"]
+
+    arr = np.load(root / "00000" / "tokens.npy")
+    assert arr.shape[1:] == (1, 4, 4, 3)   # (V=1, L=4, C=4, 3 channels)
+    # Transform channels (1=DWT, 2=FFT) are magnitudes -> non-negative.
+    assert (arr[..., 1] >= 0).all()
+    assert (arr[..., 2] >= 0).all()
+
+    # Load + run the model on the single-view (H) images.
+    ds = QKVImageDataset(root, views=["H"], channels=cfg.model.channels)
+    images, _, _ = ds[0]
+    assert images.shape[1:] == (1, 3, 4, 4)   # (V=1, chans=3, L, C)
+
+    n_streams = n_images(cfg.model.channels, 1)
+    batch_images, labels, mask, _ = collate([ds[i] for i in range(3)])
+    model_out = build_model(cfg, n_views=n_streams).eval()
+    with torch.no_grad():
+        logits = model_out(batch_images, mask)
+    assert logits.shape == (3,) and torch.isfinite(logits).all()
+
+
+def test_reuses_already_generated_examples_without_loading_the_model(tmp_path):
+    """A run whose generation finished but crashed before labeling must resume at
+    the post-generation step: label + write the manifest from the on-disk tensors
+    and meta.txt, WITHOUT ever loading the LLM (the expensive part is done)."""
+    from unittest.mock import patch
+
+    from src.extract.datasets import Example
+    from src.extract.run_extraction import run_extraction
+
+    cfg = Config()
+    cfg.data_root = str(tmp_path)
+    cfg.llm.alias = "tiny"
+    cfg.dataset.name = "triviaqa"
+    cfg.labeling.scheme = "exact_match"
+    root = cfg.example_dir()
+    root.mkdir(parents=True)
+
+    # Pre-generate: tensor + meta (label -1), NO manifest -- exactly the state a
+    # crash-after-generation leaves behind.
+    golds = ["['Paris']", "['Tokyo']", "['4', 'four']"]
+    responses = ["Paris.", "Kyoto.", "4"]           # #1 is wrong -> hallucinated
+    for i, (g, r) in enumerate(zip(golds, responses)):
+        d = root / f"{i:05d}"
+        d.mkdir()
+        np.save(d / "tokens.npy", np.zeros((2, 3, 4, 4, 3), np.float16))
+        (d / "meta.txt").write_text(
+            f"prompt: p{i}\nresponse: {r}\ngold: {g}\nscore: nan\nlabel: -1\n"
+        )
+    (root / "geometry.json").write_text(json.dumps({
+        "views": ["Q", "K", "V"], "n_rows": 4, "n_cols": 4,
+        "source": "qkv", "extraction_type": "delta", "geometry": {"n_layers": 4},
+    }))
+
+    examples = [Example(prompt=f"p{i}", gold=eval(g), idx=i)
+                for i, g in enumerate(golds)]
+
+    def fail_if_loaded(_cfg):
+        raise AssertionError("load_llm must NOT be called when all examples exist")
+
+    with patch("src.extract.run_extraction.load_llm", side_effect=fail_if_loaded), \
+         patch("src.extract.run_extraction.load_examples", return_value=examples):
+        run_extraction(cfg)   # must not raise -> model never loaded
+
+    # Manifest now exists with all three, and every example is labeled.
+    lines = (root / "manifest.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 3
+    recs = sorted((json.loads(l) for l in lines), key=lambda r: r["idx"])
+    labels = [r["label"] for r in recs]
+    assert labels == [0, 1, 0], labels    # "Kyoto." for Tokyo is the hallucination
+    for r in recs:
+        assert r["label"] in (0, 1)
+        assert r["n_tokens"] == 2
+
+
 # --------------------------------------------------------------------------
 # build_prompt_ids -- transformers v5 changed apply_chat_template's return type
 # --------------------------------------------------------------------------

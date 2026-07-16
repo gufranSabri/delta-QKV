@@ -92,7 +92,28 @@ def score_bleurt_batch(
             flat_refs.extend(refs)
         spans.append((start, len(flat_cands)))
 
-    flat_scores = scorer.score(references=flat_refs, candidates=flat_cands) if flat_cands else []
+    # Score in chunks with a progress bar rather than one giant call. A single
+    # scorer.score() over the whole corpus (tens of thousands of pairs for a 10k
+    # dataset with several gold answers each) prints NOTHING for many minutes and
+    # is indistinguishable from a hang -- and holding that many activations at
+    # once can spike GPU memory. Chunking bounds the memory and shows progress.
+    flat_scores: list[float] = []
+    if flat_cands:
+        from tqdm import tqdm
+
+        from src.utils.logger import get_logger
+
+        _log = get_logger(__name__)
+        n_pairs = len(flat_cands)
+        _log.info("BLEURT: scoring %d (candidate, reference) pairs", n_pairs)
+        chunk = 512
+        for i in tqdm(range(0, n_pairs, chunk), desc="BLEURT scoring", ncols=100):
+            flat_scores.extend(
+                scorer.score(
+                    references=flat_refs[i : i + chunk],
+                    candidates=flat_cands[i : i + chunk],
+                )
+            )
 
     out = []
     for start, end in spans:

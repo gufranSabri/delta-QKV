@@ -25,8 +25,8 @@ def write_cfg(tmp_path, data) -> str:
 def test_config_layers_over_defaults(tmp_path):
     cfg = load_config(write_cfg(tmp_path, {"dataset": {"name": "imdb"}}))
     assert cfg.dataset.name == "imdb"
-    # Untouched keys still carry the defaults.
-    assert cfg.model.fusion == "gated"
+    # Untouched keys still carry the values from configs/default.yaml.
+    assert cfg.model.fusion == "cross_attn"
     assert cfg.extract.views == ["Q", "K", "V"]
 
 
@@ -54,6 +54,11 @@ def test_unknown_section_is_rejected(tmp_path):
     ({"extract": {"views": ["Q", "Q"]}}, "duplicates"),
     ({"extract": {"pool": "median"}}, "extract.pool"),
     ({"extract": {"boundary_mode": "bounce"}}, "boundary_mode"),
+    ({"extract": {"source": "logits"}}, "extract.source"),
+    ({"extract": {"extraction_type": "wavelet"}}, "extract.extraction_type"),
+    # source=hs with an explicit non-[H] view subset is contradictory.
+    ({"extract": {"source": "hs", "views": ["Q"]}}, "single hidden-state"),
+    ({"model": {"channels": "qkv_delta"}}, "model.channels"),   # old name is gone
     ({"model": {"fusion": "magic"}}, "model.fusion"),
     ({"model": {"backbone": "vgg"}}, "model.backbone"),
     ({"labeling": {"scheme": "vibes"}}, "labeling.scheme"),
@@ -63,6 +68,24 @@ def test_unknown_section_is_rejected(tmp_path):
 def test_invalid_configs_are_caught_at_load(tmp_path, bad, msg):
     with pytest.raises(ValueError, match=msg):
         load_config(write_cfg(tmp_path, bad))
+
+
+def test_hs_source_defaults_views_to_H(tmp_path):
+    """source=hs is a single stream; leaving views unset should default it to [H]."""
+    cfg = load_config(write_cfg(tmp_path, {"extract": {"source": "hs"}}))
+    assert cfg.extract.views == ["H"]
+
+
+def test_example_dir_encodes_source_and_extraction_type(tmp_path):
+    cfg = load_config(write_cfg(tmp_path, {
+        "extract": {"source": "hs", "extraction_type": "transforms"},
+        "dataset": {"name": "triviaqa"},
+        "llm": {"alias": "llama3_8b"},
+    }))
+    # data/{source}/{extraction_type}/{dataset}/{llm_alias}
+    assert cfg.example_dir().as_posix().endswith(
+        "data/hs/transforms/triviaqa/llama3_8b"
+    )
 
 
 def test_shipped_configs_all_load():

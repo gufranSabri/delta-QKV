@@ -26,23 +26,36 @@ from src.data.dataset import (
     _set_stats,
     collate,
     compute_stats,
+    n_images,
 )
 from src.models.classifier import build_model
 from src.utils.logger import get_logger, setup_logging
 from src.utils.metrics import compute_metrics, format_metrics
 from src.utils.seed import pick_device, seed_everything
+from src.extract.datasets import HAS_TEST_CORPUS, base_name
 from src.utils.splits import make_split
 
 logger = get_logger(__name__)
 
 
 def load_source(cfg: Config, dataset_name: str, llm_alias: str, **kw) -> QKVImageDataset:
-    root = Path(cfg.data_root) / dataset_name / llm_alias
+    # Mirror Config.example_dir()'s layout, but for an ARBITRARY (dataset, llm)
+    # pair -- LODO trains over several sources that differ from cfg.dataset /
+    # cfg.llm. The source/extraction_type prefix still comes from cfg, since a run
+    # trains on one source+extraction_type at a time.
+    root = (
+        Path(cfg.data_root)
+        / cfg.extract.source
+        / cfg.extract.extraction_type
+        / dataset_name
+        / llm_alias
+    )
     return QKVImageDataset(
         root,
         views=cfg.extract.views,
         max_tokens=cfg.extract.max_tokens,
         origin=f"{llm_alias}/{dataset_name}",
+        channels=cfg.model.channels,
         **kw,
     )
 
@@ -72,8 +85,12 @@ def build_datasets(
     return sources, test_source
 
 
-def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, desc=""):
-    """One pass. Trains if `optimizer` is given, else evaluates."""
+def run_epoch(model, loader, criterion, device, optimizer=None, desc=""):
+    """One pass. Trains if `optimizer` is given, else evaluates.
+
+    Takes no scheduler: the LR schedule is ReduceLROnPlateau, which steps once
+    per epoch against the validation metric, so the caller drives it.
+    """
     training = optimizer is not None
     model.train(training)
 
@@ -81,7 +98,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, 
     all_y, all_p, all_origins = [], [], []
 
     with torch.set_grad_enabled(training):
-        for images, labels, mask, origins in tqdm(loader, desc=desc, leave=False):
+        for images, labels, mask, origins in tqdm(loader, desc=desc, leave=False, ncols=100):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
@@ -95,8 +112,6 @@ def run_epoch(model, loader, criterion, device, optimizer=None, scheduler=None, 
                 # Exploding gradients through a BiLSTM are a classic failure here.
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
 
             total_loss += loss.item()
             n_batches += 1
@@ -145,13 +160,26 @@ def train(
     sources, test_source = build_datasets(cfg, train_datasets, test_dataset, cfg.llm.alias)
     full = ConcatQKVDataset(sources) if len(sources) > 1 else sources[0]
 
-    train_idx, val_idx = make_split(
+    # Datasets that ship a separate held-out corpus (`<name>_test`) need no slice
+    # carved out of the training pool -- their test set is a different corpus.
+    # Only single-split datasets (TruthfulQA) do, otherwise we'd be discarding
+    # training data to build a test set we already have.
+    needs_slice = [d for d in train_datasets if base_name(d)[0] not in HAS_TEST_CORPUS]
+    test_fraction = cfg.train.test_fraction if needs_slice else 0.0
+    if needs_slice:
+        logger.info(
+            "%s have no separate test corpus; carving out a %.0f%% stratified test slice",
+            needs_slice, 100 * test_fraction,
+        )
+
+    train_idx, val_idx, heldout_idx = make_split(
         full.labels,
         val_fraction=cfg.train.val_fraction,
+        test_fraction=test_fraction,
         seed=cfg.train.seed,
         cache=run_dir / "split.json",
     )
-    logger.info("train %d | val %d", len(train_idx), len(val_idx))
+    logger.info("train %d | val %d | heldout %d", len(train_idx), len(val_idx), len(heldout_idx))
 
     # Normalisation statistics come from the TRAIN split only -- computing them
     # over val/test would leak those distributions into the input scaling.
@@ -183,7 +211,10 @@ def train(
     )
 
     # ---- model --------------------------------------------------------
-    model = build_model(cfg, n_views=len(cfg.extract.views)).to(device)
+    # n_views here means "number of CNN streams", which is the number of IMAGES
+    # after regrouping -- not len(extract.views). They differ under model.channels.
+    n_streams = n_images(cfg.model.channels, len(cfg.extract.views))
+    model = build_model(cfg, n_views=n_streams).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("model: %s parameters", f"{n_params:,}")
 
@@ -202,12 +233,57 @@ def train(
             logger.info("pos_weight = %.3f (neg=%d, pos=%d)", pos_weight.item(), n_neg, n_pos)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
-    )
-    total_steps = max(1, len(train_loader) * cfg.train.epochs)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=cfg.train.lr, total_steps=total_steps, pct_start=0.1
+
+    # Discriminative LR: the CNN backbones get lr * backbone_lr_scale, everything
+    # else (fusion, temporal, head) gets the full lr. A pretrained backbone
+    # (scale < 1) wants a gentler LR than the randomly-initialised head, or it
+    # gets its ImageNet features wrecked before the head stabilises. scale == 1.0
+    # collapses to a single group -- correct for scratch / random-init, where
+    # nothing is pretrained. ReduceLROnPlateau scales every group by the same
+    # factor, so the backbone:head LR ratio holds for the whole run.
+    scale = cfg.train.backbone_lr_scale
+    backbone_lr = cfg.train.lr * scale
+    if scale == 1.0:
+        param_groups = [{"params": model.parameters(), "lr": cfg.train.lr}]
+    else:
+        backbone_params = list(model.backbones.parameters())
+        backbone_ids = {id(p) for p in backbone_params}
+        other_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+        param_groups = [
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": other_params, "lr": cfg.train.lr},
+        ]
+        logger.info(
+            "discriminative LR: backbone=%.2e, rest=%.2e (scale=%.3g)",
+            backbone_lr, cfg.train.lr, scale,
+        )
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
+
+    # Linear decay: hold the LR flat for the first `lr_decay_start` epochs, then
+    # ramp it linearly down to `lr_final_scale` of its initial value by the last
+    # epoch. LambdaLR multiplies each group's OWN initial LR by the same factor,
+    # so the backbone:head ratio set above holds for the entire run.
+    #
+    # Stepped once per EPOCH (not per batch), so it is deliberately not handed to
+    # run_epoch(). Note the slope is tied to `epochs`: if early stopping fires
+    # first, the LR simply never reaches the floor.
+    warm = cfg.train.lr_decay_start
+    final = cfg.train.lr_final_scale
+    total = cfg.train.epochs
+
+    def lr_lambda(epoch: int) -> float:      # epoch is 0-based
+        if epoch < warm:
+            return 1.0
+        # Guard the degenerate case where decay starts on/after the final epoch.
+        span = max(1, total - warm)
+        progress = min(1.0, (epoch - warm) / span)
+        return 1.0 + progress * (final - 1.0)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    logger.info(
+        "linear LR decay: flat for %d epochs, then -> %.3g x initial by epoch %d",
+        warm, final, total,
     )
 
     # ---- loop ---------------------------------------------------------
@@ -216,15 +292,21 @@ def train(
 
     for epoch in range(1, cfg.train.epochs + 1):
         t0 = time.time()
+        # No scheduler here: the LR schedule steps per EPOCH, not per batch.
         tr, _ = run_epoch(model, train_loader, criterion, device,
-                          optimizer, scheduler, desc=f"epoch {epoch} train")
+                          optimizer, desc=f"epoch {epoch} train")
         va, va_origins = run_epoch(model, val_loader, criterion, device,
                                    desc=f"epoch {epoch} val")
 
-        logger.info("epoch %2d | train loss %.4f AUROC %.4f | val %s | %.0fs",
-                    epoch, tr["loss"], tr["auroc"], format_metrics(va), time.time() - t0)
+        lrs = [g["lr"] for g in optimizer.param_groups]
+        logger.info("epoch %2d | train loss %.4f AUROC %.4f | val %s | lr %s | %.0fs",
+                    epoch, tr["loss"], tr["auroc"], format_metrics(va),
+                    " ".join(f"{lr:.2e}" for lr in lrs), time.time() - t0)
 
-        record = {"epoch": epoch, "train": tr, "val": va}
+        # Linear decay is a pure function of the epoch index -- no metric.
+        scheduler.step()
+
+        record = {"epoch": epoch, "train": tr, "val": va, "lr": lrs}
 
         # Model selection on validation AUROC, never on test.
         if va["auroc"] > best_auroc:
@@ -235,8 +317,14 @@ def train(
                     "config": cfg.to_dict(),
                     "stats": stats,
                     "views": cfg.extract.views,
+                    "channels": cfg.model.channels,
                     "epoch": epoch,
                     "val_auroc": va["auroc"],
+                    # So test.py can tell an in-distribution eval (must be
+                    # restricted to heldout_idx) from a zero-shot one (evaluate
+                    # the whole corpus), and recover the exact held-out rows.
+                    "train_datasets": list(train_datasets),
+                    "heldout_idx": heldout_idx,
                 },
                 run_dir / "best.pt",
             )

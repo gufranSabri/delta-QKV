@@ -2,7 +2,7 @@
 # ============================================================================
 # ACT-ViT -- EXTRACTION for every (dataset x LLM), train + held-out test.
 #
-#   datasets  triviaqa, hotpotqa, hotpotqa_with_context, imdb, movies
+#   datasets  triviaqa, hotpotqa, hotpotqa_with_context
 #   LLMs      mistral_7b, llama3_8b, qwen2.5_7b
 #   labels    exact_match  -- no BLEURT needed
 #
@@ -56,27 +56,3 @@ purge "models--meta-llama--Meta-Llama-3-8B-Instruct" "datasets--hotpot_qa"
 python main.py --config configs/hotpotqa_with_context/qwen2.5_7b.yaml extract
 python main.py --config configs/hotpotqa_with_context/qwen2.5_7b.yaml extract --set dataset.name=hotpotqa_with_context_test
 purge "models--Qwen--Qwen2.5-7B-Instruct" "datasets--hotpot_qa"
-
-# ── imdb ──────────────────────────────────────────────────────────────────
-python main.py --config configs/imdb/mistral_7b.yaml extract
-python main.py --config configs/imdb/mistral_7b.yaml extract --set dataset.name=imdb_test
-purge "models--mistralai--Mistral-7B-Instruct-v0.2" "datasets--imdb"
-python main.py --config configs/imdb/llama3_8b.yaml extract
-python main.py --config configs/imdb/llama3_8b.yaml extract --set dataset.name=imdb_test
-purge "models--meta-llama--Meta-Llama-3-8B-Instruct" "datasets--imdb"
-python main.py --config configs/imdb/qwen2.5_7b.yaml extract
-python main.py --config configs/imdb/qwen2.5_7b.yaml extract --set dataset.name=imdb_test
-purge "models--Qwen--Qwen2.5-7B-Instruct" "datasets--imdb"
-
-# ── movies ────────────────────────────────────────────────────────────────
-# movies ships as a local CSV (ACT-ViT/data/), not an HF dataset -- nothing to
-# purge on the dataset side, so the second purge arg is empty.
-python main.py --config configs/movies/mistral_7b.yaml extract
-python main.py --config configs/movies/mistral_7b.yaml extract --set dataset.name=movies_test
-purge "models--mistralai--Mistral-7B-Instruct-v0.2" ""
-python main.py --config configs/movies/llama3_8b.yaml extract
-python main.py --config configs/movies/llama3_8b.yaml extract --set dataset.name=movies_test
-purge "models--meta-llama--Meta-Llama-3-8B-Instruct" ""
-python main.py --config configs/movies/qwen2.5_7b.yaml extract
-python main.py --config configs/movies/qwen2.5_7b.yaml extract --set dataset.name=movies_test
-purge "models--Qwen--Qwen2.5-7B-Instruct" ""

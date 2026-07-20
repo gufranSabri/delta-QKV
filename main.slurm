@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=l40s:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=60G
-#SBATCH --time=3:00:00
+#SBATCH --time=1-00:00:00
 
 set -uo pipefail
 
@@ -24,4 +24,4 @@ export TF_CPP_MIN_LOG_LEVEL=3
 
 bash scripts/install.sh --bleurt || exit 1
 
-bash current_run.sh
+bash all-datasets_extract.sh

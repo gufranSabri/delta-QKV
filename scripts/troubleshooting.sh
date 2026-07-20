@@ -14,7 +14,7 @@
 salloc --gpus-per-node=l40s:1 --cpus-per-task=24 --mem=60G --time=3:00:00 --account=aip-lsigal
 
 # Longer / bigger:
-# salloc --gpus-per-node=h100:1 --cpus-per-task=24 --mem=60G --time=1:00:00 --account=aip-lsigal
+# salloc --gpus-per-node=h100:1 --cpus-per-task=24 --mem=60G --time=3:00:00 --account=aip-lsigal
 
 
 # ── STEP 1: ENVIRONMENT ────────────────────────────────────────────────────

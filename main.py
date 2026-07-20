@@ -7,11 +7,13 @@ Subcommands:
     train     train the detector (single dataset, or leave-one-dataset-out)
     test      evaluate a saved checkpoint
     inspect   render token images to PNG so you can actually look at them
+    cam       Grad-CAM/Eigen-CAM: where the detector looks, per image, for one example
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from src.config import load_config
@@ -53,6 +55,12 @@ def main(argv=None) -> int:
         help="override any config key, e.g. --set model.fusion=bilinear "
              "--set extract.views='[V]'",
     )
+    common.add_argument(
+        "--slurm", action="store_true",
+        help="slurm mode: disable tqdm progress bars (they spam log files "
+             "instead of redrawing in place). Auto-enabled when SLURM_JOB_ID "
+             "is set (i.e. running under sbatch/srun).",
+    )
 
     parser = argparse.ArgumentParser(
         prog="delta-QKV",
@@ -88,6 +96,22 @@ def main(argv=None) -> int:
     p_in.add_argument("--tokens", type=int, default=4, help="how many tokens to render")
     p_in.add_argument("--out", default=None)
 
+    p_cam = sub.add_parser(
+        "cam", parents=[common],
+        help="Grad-CAM/Eigen-CAM: where the detector looks, per image, for one example",
+    )
+    p_cam.add_argument("--checkpoint", required=True)
+    p_cam.add_argument("--dataset", default=None, help="defaults to the config's dataset")
+    p_cam.add_argument("--idx", type=int, default=0, help="example index")
+    p_cam.add_argument(
+        "--method", choices=["gradcam", "eigencam"], default="gradcam",
+    )
+    p_cam.add_argument(
+        "--max-tokens", type=int, default=20,
+        help="cap on generated-token columns shown (0 or negative = show all)",
+    )
+    p_cam.add_argument("--out", default=None)
+
     # Two-stage parse. When a flag is declared on BOTH the top-level parser and a
     # subparser (via `parents`), argparse runs the subparser LAST, so its default
     # silently overwrites whatever the top-level flag captured -- i.e.
@@ -101,10 +125,15 @@ def main(argv=None) -> int:
         args.config = pre.config
     # Merge, don't replace: --set may legitimately appear on both sides.
     args.set = list(pre.set or []) + [s for s in (args.set or []) if s not in (pre.set or [])]
+    args.slurm = args.slurm or pre.slurm or "SLURM_JOB_ID" in os.environ
 
     if not args.config:
         parser.error("--config is required (before or after the subcommand)")
     setup_logging()
+
+    from src.utils.progress import set_slurm_mode
+
+    set_slurm_mode(args.slurm)
 
     cfg = load_config(args.config, overrides=_overrides(args))
 
@@ -137,6 +166,16 @@ def main(argv=None) -> int:
         from src.inspect_images import inspect
 
         inspect(cfg, idx=args.idx, n_tokens=args.tokens, out=args.out)
+
+    elif args.cmd == "cam":
+        from src.cam import run_cam
+
+        max_tokens_shown = None if args.max_tokens <= 0 else args.max_tokens
+        run_cam(
+            cfg, args.checkpoint, dataset_name=args.dataset,
+            idx=args.idx, method=args.method, out=args.out,
+            max_tokens_shown=max_tokens_shown,
+        )
 
     return 0
 

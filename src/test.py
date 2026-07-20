@@ -147,7 +147,9 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
     logger.info("wrote %s", dest)
 
     # ── Save to docs/results.csv ───────────────────────────────────────────
-    _save_to_results_csv(cfg, name, metrics, ckpt_path)
+    # Disabled during ablation runs -- results live in each run's test_*.json;
+    # re-enable when ablation.sh's sweep is done and the CSV should track again.
+    # _save_to_results_csv(cfg, name, metrics, ckpt_path)
 
     return out
 
@@ -158,7 +160,7 @@ def _resolve_eval_target(name: str, ckpt: dict) -> tuple[str, list[int] | None]:
     The rule, in order:
 
     1. The dataset ships a real held-out corpus  -> evaluate `<name>_test` in full.
-       (TriviaQA, HotpotQA(+ctx), IMDB, Movies -- mirrors ACT-ViT.)
+       (TriviaQA, HotpotQA(+ctx) -- mirrors ACT-ViT.)
     2. It doesn't, but we trained on it          -> evaluate the stratified slice
        held out at train time. (TruthfulQA.)
     3. We never trained on it                    -> zero-shot; evaluate it in full.
@@ -198,8 +200,6 @@ DATASET_COLS = {
     "triviaqa": "TriviaQA",
     "hotpotqa": "HotpotQA",
     "hotpotqa_with_context": "HotpotQA_with_context",
-    "imdb": "IMDB",
-    "movies": "Movies",
     "coqa": "CoQA",
     "tydiqa": "TyDiQA-GP",
 }

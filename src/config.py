@@ -173,14 +173,14 @@ class Config:
     labeling: LabelingConfig = field(default_factory=LabelingConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    data_root: str = "data"
+    data_root: str = "/scratch/ahmedubc/delta-QKV-data"
     runs_root: str = "runs"
 
     # ---- derived paths -------------------------------------------------
     def example_dir(self, root: str | None = None) -> Path:
         """Where this combo's features live:
 
-            data/{source}/{extraction_type}/{dataset}/{llm_alias}/
+            {data_root}/{source}/{extraction_type}/{dataset}/{llm_alias}/
 
         `source` (qkv|hs) and `extraction_type` (delta|transforms) are baked into
         the path because they change what is stored on disk -- the same dataset x

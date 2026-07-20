@@ -99,15 +99,14 @@ def score_bleurt_batch(
     # once can spike GPU memory. Chunking bounds the memory and shows progress.
     flat_scores: list[float] = []
     if flat_cands:
-        from tqdm import tqdm
-
         from src.utils.logger import get_logger
+        from src.utils.progress import progress
 
         _log = get_logger(__name__)
         n_pairs = len(flat_cands)
         _log.info("BLEURT: scoring %d (candidate, reference) pairs", n_pairs)
         chunk = 512
-        for i in tqdm(range(0, n_pairs, chunk), desc="BLEURT scoring", ncols=100):
+        for i in progress(range(0, n_pairs, chunk), desc="BLEURT scoring", ncols=100):
             flat_scores.extend(
                 scorer.score(
                     references=flat_refs[i : i + chunk],

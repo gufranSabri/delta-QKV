@@ -280,8 +280,6 @@ stopping or checkpoint selection. Per dataset:
 |---|---|---|
 | TriviaQA | `train` | `validation` → `triviaqa_test` |
 | HotpotQA (± context) | `train` | `validation` → `hotpotqa_test` |
-| IMDB | `train` | `test` → `imdb_test` |
-| Movies | `movie_qa_train.csv` | `movie_qa_test.csv` → `movies_test` |
 | CoQA | train JSON | `coqa-dev-v1.0.json` → `coqa_test` |
 | TyDiQA-GP | `train` (English) | `validation` → `tydiqa_test` |
 | **TruthfulQA** | *817 rows, one split* | stratified **60/20/20** — no twin corpus exists |
@@ -304,15 +302,15 @@ interchangeable, and mixing them produces numbers that compare to nothing.
 
 |  | ACT-ViT | HalluShift |
 |---|---|---|
-| datasets | TriviaQA, HotpotQA, HotpotQA+ctx, IMDB, Movies | TruthfulQA, TriviaQA, CoQA, TyDiQA-GP |
+| datasets | TriviaQA, HotpotQA, HotpotQA+ctx | TruthfulQA, TriviaQA, CoQA, TyDiQA-GP |
 | LLMs | Mistral-7B-Instruct, Llama-3-8B-Instruct, Qwen2.5-7B-Instruct | Llama-2-7b, Llama-3.1-8B, OPT-6.7B (**base**, not instruct) |
-| labels | `exact_match` (substring / sentiment) | `bleurt` (BLEURT-20-D12, hallucination iff score ≤ 0.5) |
+| labels | `exact_match` (substring) | `bleurt` (BLEURT-20-D12, hallucination iff score ≤ 0.5) |
 | generation | 100 new tokens | 64 new tokens, greedy |
-| grid | 15 cells | 12 cells |
+| grid | 9 cells | 12 cells |
 | BLEURT | not needed | **required** |
 
 The two overlap on **TriviaQA only**. ACT-ViT never evaluated on TruthfulQA/CoQA/TyDiQA, and
-HalluShift never on HotpotQA/IMDB/Movies — so most cells of `docs/results.csv` are legitimately
+HalluShift never on HotpotQA — so most cells of `docs/results.csv` are legitimately
 `-`, not missing work.
 
 ### Run a suite
@@ -357,7 +355,7 @@ Or drive it directly:
 
 ```bash
 python main.py --config configs/triviaqa/llama3_8b.yaml train \
-  --train-datasets hotpotqa,imdb,movies \
+  --train-datasets hotpotqa,hotpotqa_with_context \
   --test-dataset triviaqa            # never seen during training
 ```
 
@@ -392,11 +390,6 @@ Three caveats that decide whether a comparison is meaningful:
    validation set* — the same 25% drives early stopping *and* is reported (`classifier.py:190`
    and `:224`). We deliberately do not copy this. Our numbers are therefore slightly pessimistic
    relative to theirs, which is the safe direction.
-
-There is one more, inherited rather than introduced: ACT-ViT's shipped `movie_qa_*.csv` files
-share ~102 questions between train and test (and the train file has internal duplicates: 10,000
-rows, 9,856 unique). We reproduce their corpora faithfully rather than deduplicating, so the
-head-to-head stays apples-to-apples. It affects ~1.3% of the Movies test set.
 
 ---
 

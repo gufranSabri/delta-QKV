@@ -18,7 +18,7 @@ class Example:
 
 
 def _truncate_words(text: str, n: int) -> str:
-    """Cap context length by words. Long IMDB reviews / HotpotQA contexts would
+    """Cap context length by words. Long HotpotQA contexts would
     otherwise dominate the prompt and slow generation to a crawl."""
     words = text.split()
     return " ".join(words[:n])
@@ -171,67 +171,11 @@ def load_hotpotqa(cfg, n: int, with_context: bool, split: str = "train") -> list
     return out
 
 
-def load_imdb(cfg, n: int, split: str = "train") -> list[Example]:
-    from datasets import load_dataset
-
-    # IMDB ships sorted by label (all negatives, then all positives), so the
-    # shuffle is load-bearing: without it an n-sample cap yields one class.
-    ds = load_dataset("imdb", split=split).shuffle(seed=42)
-    out = []
-    for row in ds:
-        if len(out) >= n:
-            break
-        review = _truncate_words(row["text"], 200)
-        out.append(
-            Example(
-                prompt=cfg.dataset.prompt_template.format(review=review),
-                gold=int(row["label"]),   # 0 = negative, 1 = positive
-                idx=len(out),
-            )
-        )
-    return out
-
-
-def load_movies(cfg, n: int, split: str = "train") -> list[Example]:
-    """ACT-ViT ships this one as a CSV rather than an HF dataset."""
-    import csv
-    from pathlib import Path
-
-    from src.config import REPO_ROOT
-
-    fname = "movie_qa_test.csv" if split == "test" else "movie_qa_train.csv"
-    path = Path(REPO_ROOT) / "ACT-ViT" / "data" / fname
-    if not path.exists():
-        raise FileNotFoundError(
-            f"movies dataset CSV not found at {path}. It ships with the ACT-ViT repo."
-        )
-
-    out = []
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            if len(out) >= n:
-                break
-            question = row.get("question") or row.get("Question")
-            answer = row.get("answer") or row.get("Answer")
-            if not question or not answer:
-                continue
-            out.append(
-                Example(
-                    prompt=cfg.dataset.prompt_template.format(question=question),
-                    gold=answer,
-                    idx=len(out),
-                )
-            )
-    return out
-
-
 LOADERS = {
     "triviaqa": lambda cfg, n, sp: load_triviaqa(cfg, n, split=sp),
     "truthfulqa": lambda cfg, n, sp: load_truthfulqa(cfg, n),
     "hotpotqa": lambda cfg, n, sp: load_hotpotqa(cfg, n, with_context=False, split=sp),
     "hotpotqa_with_context": lambda cfg, n, sp: load_hotpotqa(cfg, n, with_context=True, split=sp),
-    "imdb": lambda cfg, n, sp: load_imdb(cfg, n, split=sp),
-    "movies": lambda cfg, n, sp: load_movies(cfg, n, split=sp),
     "coqa": lambda cfg, n, sp: load_coqa(cfg, n, split=sp),
     "tydiqa": lambda cfg, n, sp: load_tydiqa(cfg, n, split=sp),
 }
@@ -250,8 +194,6 @@ SPLIT_SOURCES = {
     "triviaqa": {"train": "train", "test": "validation"},
     "hotpotqa": {"train": "train", "test": "validation"},
     "hotpotqa_with_context": {"train": "train", "test": "validation"},
-    "imdb": {"train": "train", "test": "test"},
-    "movies": {"train": "train", "test": "test"},
     "coqa": {"train": "train", "test": "dev"},
     "tydiqa": {"train": "train", "test": "validation"},
     # TruthfulQA has exactly one split (817 rows, `validation`) and no held-out

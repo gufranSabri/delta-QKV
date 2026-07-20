@@ -15,3 +15,8 @@ extract:
   # default n_cols=L cannot pool the K/V views. 32 divides both D_q=3584 and
   # D_kv=512, so we fix n_cols=32 -> images are 28x32 (very slightly non-square).
   n_cols: 32
+
+labeling:
+  scheme: bleurt              # HalluShift: BLEURT-20-D12
+  bleurt_threshold: 0.5       # hallucination = 1 if max BLEURT <= 0.5
+  bleurt_checkpoint: models/BLEURT-20-D12

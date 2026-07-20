@@ -18,6 +18,7 @@ On-disk layout, per (source, extraction_type, dataset, LLM):
         ...
         manifest.jsonl      one JSON line per example (the training index)
         geometry.json       the model geometry the images were built with
+        progress.log        "i/total" appended every 100 generated examples
 
 The view axis V is a REAL axis in the stored array -- it is never folded into
 channels. For source=qkv that keeps "drop a view" (extract.views: [Q]) a pure
@@ -37,7 +38,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from src.config import Config
 from src.extract.datasets import load_examples
@@ -45,6 +45,7 @@ from src.extract.qkv_hooks import capture_hidden, capture_qkv, read_geometry
 from src.extract.tensor_ops import build_view_image, pool_layer_axis
 from src.label.registry import label_examples
 from src.utils.logger import get_logger
+from src.utils.progress import progress
 
 logger = get_logger(__name__)
 
@@ -371,7 +372,18 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
 
         save_dtype = DTYPES[cfg.extract.dtype]
 
-        for ex in tqdm(to_generate, desc=f"extract {cfg.dataset.name}/{cfg.llm.alias}", ncols=100):
+        # Plain-text progress log next to geometry.json: one line every 100
+        # examples ("i/total"). tqdm (via progress()) is a no-op under --slurm
+        # (see src/utils/progress.py), so on a cluster this is otherwise the
+        # only way to see how far a long extraction has gotten without
+        # tailing a log file full of generation internals.
+        progress_log = (root / "progress.log").open("a")
+        total_to_generate = len(to_generate)
+
+        for i, ex in enumerate(
+            progress(to_generate, desc=f"extract {cfg.dataset.name}/{cfg.llm.alias}", ncols=100),
+            start=1,
+        ):
             out_dir = root / f"{ex.idx:05d}"
             input_ids = build_prompt_ids(ex.prompt, tokenizer, cfg.llm.name, device)
 
@@ -420,6 +432,12 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
                 out_dir, images, ex.prompt, response, ex.gold,
                 score=float("nan"), label=-1, save_dtype=save_dtype,
             )
+
+            if i % 100 == 0 or i == total_to_generate:
+                progress_log.write(f"{i}/{total_to_generate}\n")
+                progress_log.flush()
+
+        progress_log.close()
     elif reused:
         logger.info("nothing to generate; going straight to labeling + manifest")
 

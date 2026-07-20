@@ -17,7 +17,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
 from src.config import Config
 from src.data.dataset import (
@@ -32,6 +31,7 @@ from src.data.dataset import (
 from src.models.classifier import build_model
 from src.utils.logger import get_logger, setup_logging
 from src.utils.metrics import compute_metrics, format_metrics
+from src.utils.progress import progress
 from src.utils.seed import pick_device, seed_everything
 from src.utils.snapshot import snapshot_code
 from src.extract.datasets import HAS_TEST_CORPUS, base_name
@@ -123,7 +123,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None, desc=""):
     all_y, all_p, all_origins = [], [], []
 
     with torch.set_grad_enabled(training):
-        for batch in tqdm(loader, desc=desc, leave=False, ncols=100):
+        for batch in progress(loader, desc=desc, leave=False, ncols=100):
             model_args, labels, origins = _unpack_batch(batch, device)
 
             logits = model(*model_args)
@@ -331,7 +331,13 @@ def train(
         num_workers=cfg.train.num_workers,
         pin_memory=device.type == "cuda",
     )
-    train_loader = DataLoader(Subset(full, train_idx), shuffle=True, **loader_kw)
+    # drop_last on TRAIN only: BatchNorm1d in TemporalEncoder's conv stack
+    # can't compute a variance over a batch of size 1, which a trailing
+    # remainder batch hits whenever len(train_idx) % batch_size == 1. Val/test
+    # must never drop data -- that would silently shrink the reported metrics.
+    train_loader = DataLoader(
+        Subset(full, train_idx), shuffle=True, drop_last=True, **loader_kw
+    )
     val_loader = DataLoader(Subset(full, val_idx), shuffle=False, **loader_kw)
     test_loader = (
         DataLoader(test_source, shuffle=False, **loader_kw) if test_source else None

@@ -1,0 +1,22 @@
+# hotpotqa_with_context x Qwen/Qwen2.5-1.5B
+# geometry: L=28  D_q=1536  D_kv=256  ->  image 28x32 per view (see extract.n_cols)
+llm:
+  name: Qwen/Qwen2.5-1.5B
+  alias: qwen2.5_1.5b
+
+dataset:
+  name: hotpotqa_with_context
+  n_samples: 10000
+  max_new_tokens: 100
+  prompt_template: "Answer the question concisely based on the context:\n{context}\nQ: {question} A:"
+
+extract:
+  # Qwen2.5-1.5B has L=28 layers but D_kv=256, and 28 does not divide 256, so the
+  # default n_cols=L cannot pool the K/V views. 32 divides both D_q=1536 and
+  # D_kv=256, so we fix n_cols=32 -> images are 28x32 (very slightly non-square).
+  n_cols: 32
+
+labeling:
+  scheme: bleurt              # HalluShift: BLEURT-20-D12
+  bleurt_threshold: 0.5       # hallucination = 1 if max BLEURT <= 0.5
+  bleurt_checkpoint: models/BLEURT-20-D12

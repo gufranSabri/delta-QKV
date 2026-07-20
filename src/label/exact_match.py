@@ -43,7 +43,7 @@ def _as_list(value) -> list[str]:
 def correctness_substring(answer: str, gold) -> int:
     """Correct if ANY gold answer appears anywhere in the response.
 
-    Used for triviaqa (many aliases), hotpotqa and movies. Case-insensitive.
+    Used for triviaqa (many aliases) and hotpotqa. Case-insensitive.
     This is a lenient criterion -- it rewards a response that contains the right
     answer even when buried in surrounding text, which is what these baselines do
     (the models are prompted to answer concisely, so the response is short).
@@ -58,45 +58,12 @@ def correctness_substring(answer: str, gold) -> int:
     return 0
 
 
-def correctness_imdb(answer: str, gold) -> int:
-    """Sentiment classification: does the response name the right sentiment?
-
-    Gold is 0 (negative) or 1 (positive), or the label word itself. We take
-    whichever of 'positive'/'negative' appears FIRST in the response -- a model
-    that says "negative ... though some find it positive" has answered negative.
-    """
-    if not answer:
-        return 0
-
-    names = {0: "negative", 1: "positive"}
-    if isinstance(gold, str):
-        gold_word = gold.lower().strip()
-    else:
-        gold_word = names.get(int(gold))
-    if gold_word not in ("negative", "positive"):
-        return 0
-
-    low = answer.lower()
-    i_neg = low.find("negative")
-    i_pos = low.find("positive")
-
-    if i_neg == -1 and i_pos == -1:
-        return 0  # no answer given
-    if i_pos == -1 or (i_neg != -1 and i_neg < i_pos):
-        predicted = "negative"
-    else:
-        predicted = "positive"
-    return int(predicted == gold_word)
-
-
 # Which scorer each dataset uses. `_test` variants share their parent's scorer.
 CORRECTNESS_FN = {
     "triviaqa": correctness_substring,
     "hotpotqa": correctness_substring,
     "hotpotqa_with_context": correctness_substring,
-    "movies": correctness_substring,
     "truthfulqa": correctness_substring,
-    "imdb": correctness_imdb,
 }
 
 

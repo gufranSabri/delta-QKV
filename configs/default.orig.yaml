@@ -32,7 +32,7 @@ extract:
   l_eff: null                 # null -> keep the model's L. Set for cross-LLM runs.
 
 labeling:
-  scheme: bleurt               # exact_match | bleurt -- every dataset config uses bleurt
+  scheme: exact_match         # exact_match | bleurt
   bleurt_threshold: 0.5
   bleurt_checkpoint: models/BLEURT-20-D12
 
@@ -87,5 +87,5 @@ train:
   test_fraction: 0.2
   balance_classes: true
 
-data_root: /scratch/ahmedubc/delta-QKV-data   # extracted data is large + regenerable -- lives on scratch, not /project
+data_root: data
 runs_root: runs

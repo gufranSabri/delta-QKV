@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Scan runs/*/ and write runs/results.csv: one row per run, its test metrics.
+"""Scan runs/*/ and write result tables.
 
 A run's numbers come from its test_<dataset>.json (the held-out test set --
 see src/test.py). A run with no test_*.json yet (still training, or `test`
-was never run) still gets a row, with every metric cell left empty rather
-than being skipped -- so the table always reflects every run directory that
-exists, not just the finished ones.
+was never run) still gets a row in runs/results.csv, with every metric cell
+left empty rather than being skipped -- so that table always reflects every
+run directory that exists, not just the finished ones.
+
+Three outputs:
+    runs/results.csv                 one row per run (unchanged behaviour)
+    runs/results_<dataset>.csv       one such file per dataset, all its runs
+                                      combined (rows with no test_*.json yet
+                                      are excluded -- there is no AUROC to
+                                      rank or compare there)
+    runs/results_best.csv            one row per dataset: its single
+                                      highest-AUROC run
 
     python scripts/collect_results.py [--runs-root runs] [--out runs/results.csv]
 """
@@ -23,6 +32,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 METRIC_COLS = [
     "auroc", "accuracy", "precision", "recall", "f1", "pr_auc", "tpr@5fpr", "n",
 ]
+
+FIELDNAMES = ["model", "llm", "dataset", *METRIC_COLS]
 
 
 def _find_test_json(run_dir: Path) -> Path | None:
@@ -62,8 +73,16 @@ def collect_row(run_dir: Path) -> dict:
     return row
 
 
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--runs-root", default=str(REPO_ROOT / "runs"))
     ap.add_argument("--out", default=None, help="defaults to <runs-root>/results.csv")
     args = ap.parse_args()
@@ -74,13 +93,32 @@ def main() -> int:
     run_dirs = sorted(d for d in runs_root.iterdir() if d.is_dir())
     rows = [collect_row(d) for d in run_dirs]
 
-    fieldnames = ["model", "llm", "dataset", *METRIC_COLS]
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
+    _write_csv(out_path, rows)
     print(f"wrote {out_path} ({len(rows)} runs)")
+
+    # Only rows with a real test result (a dataset name and a numeric AUROC)
+    # are useful for the per-dataset / best-of tables -- an unfinished run has
+    # nothing to combine or rank.
+    scored = [r for r in rows if r["dataset"] and isinstance(r["auroc"], float)]
+
+    by_dataset: dict[str, list[dict]] = {}
+    for row in scored:
+        by_dataset.setdefault(row["dataset"], []).append(row)
+
+    for dataset, dataset_rows in sorted(by_dataset.items()):
+        dataset_rows = sorted(dataset_rows, key=lambda r: r["auroc"], reverse=True)
+        dataset_path = out_path.parent / f"results_{dataset}.csv"
+        _write_csv(dataset_path, dataset_rows)
+        print(f"wrote {dataset_path} ({len(dataset_rows)} runs)")
+
+    best_rows = [
+        max(dataset_rows, key=lambda r: r["auroc"])
+        for _, dataset_rows in sorted(by_dataset.items())
+    ]
+    best_path = out_path.parent / "results_best.csv"
+    _write_csv(best_path, best_rows)
+    print(f"wrote {best_path} ({len(best_rows)} datasets)")
+
     return 0
 
 

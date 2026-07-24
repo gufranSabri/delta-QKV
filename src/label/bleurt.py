@@ -54,10 +54,15 @@ def score_bleurt(
     checkpoint: str = "models/BLEURT-20-D12",
     threshold: float = 0.5,
 ) -> tuple[float, int]:
-    """Returns (max_bleurt_score, label). label = 1 (hallucinated) if score <= threshold."""
+    """Returns (max_bleurt_score, label). label = 1 (hallucinated) if score <= threshold.
+
+    An empty answer or an empty-string reference is still scored by BLEURT, not
+    hard-labelled -- HalluShift applies no such guard (bleurt_processing just
+    thresholds whatever score comes back, functions.py:166). Only a truly empty
+    reference LIST (no gold answers at all) has nothing to score against.
+    """
     refs = _as_list(gold)
-    if not refs or not answer.strip():
-        # No reference to compare against, or an empty response: treat as hallucination.
+    if not refs:
         return 0.0, 1
 
     scorer = _get_scorer(checkpoint)
@@ -87,7 +92,9 @@ def score_bleurt_batch(
     for answer, gold in zip(answers, golds):
         refs = _as_list(gold)
         start = len(flat_cands)
-        if refs and answer.strip():
+        # Score even an empty answer/reference -- only a genuinely empty
+        # reference LIST has nothing to compare against. See score_bleurt.
+        if refs:
             flat_cands.extend([answer] * len(refs))
             flat_refs.extend(refs)
         spans.append((start, len(flat_cands)))
@@ -116,7 +123,7 @@ def score_bleurt_batch(
 
     out = []
     for start, end in spans:
-        if start == end:  # no refs / empty answer
+        if start == end:  # no refs at all
             out.append((0.0, 1))
         else:
             best = float(max(flat_scores[start:end]))

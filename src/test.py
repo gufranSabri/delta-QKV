@@ -11,7 +11,6 @@ from torch.utils.data import DataLoader, Subset
 
 from src.config import Config
 from src.data.dataset import collate, n_images
-from src.extract.datasets import HAS_TEST_CORPUS, base_name
 from src.models.classifier import build_model
 from src.train import load_source, report_gates, run_epoch
 from src.utils.logger import get_logger
@@ -74,21 +73,6 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
         )
         cfg.model.include = ckpt_include
 
-    # Same story for stream2: it adds a whole second CNN stream, so the
-    # checkpoint's value wins. Checkpoints written before this option existed
-    # carry no key -> single-stream, matching their actual saved shape.
-    ckpt_stream2_enable = ckpt.get("stream2_enable", False)
-    ckpt_stream2_include = ckpt.get("stream2_include", None)
-    if ckpt_stream2_enable != cfg.model.stream2.enable or ckpt_stream2_include != cfg.model.stream2.include:
-        logger.warning(
-            "checkpoint was trained with stream2 enable=%r include=%r but config "
-            "asks for enable=%r include=%r; using the CHECKPOINT's",
-            ckpt_stream2_enable, ckpt_stream2_include,
-            cfg.model.stream2.enable, cfg.model.stream2.include,
-        )
-        cfg.model.stream2.enable = ckpt_stream2_enable
-        cfg.model.stream2.include = ckpt_stream2_include
-
     name = dataset_name or cfg.dataset.name
     name, eval_set = _resolve_eval_target(name, ckpt)
 
@@ -104,7 +88,7 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
         if not eval_set:
             raise ValueError(
                 f"checkpoint was trained on {name!r} but carries no held-out indices. "
-                "It predates the three-way split; retrain before testing on it."
+                "It predates the held-out split; retrain before testing on it."
             )
         eval_data = Subset(source, eval_set)
 
@@ -122,21 +106,16 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
     # Number of CNN streams = number of images after regrouping and `include`
     # filtering, not len(views).
     n_streams = n_images(cfg.model.channels, len(views), cfg.model.include)
-    n_streams2 = None
-    if cfg.model.stream2.enable:
-        n_streams2 = n_images(cfg.model.channels, len(views), cfg.model.stream2.include)
-    model = build_model(cfg, n_views=n_streams, n_views2=n_streams2).to(device)
+    model = build_model(cfg, n_views=n_streams).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
     criterion = torch.nn.BCEWithLogitsLoss()
-    metrics, per_origin = run_epoch(model, loader, criterion, device, desc="test")
+    metrics = run_epoch(model, loader, criterion, device, desc="test")
 
     logger.info("TEST %s | %s", source.origin, format_metrics(metrics))
 
     out = {"dataset": name, "checkpoint": str(ckpt_path), "metrics": metrics}
-    if per_origin:
-        out["per_origin"] = per_origin
 
     gates = report_gates(model, loader, device, cfg)
     if gates:
@@ -159,31 +138,22 @@ def _resolve_eval_target(name: str, ckpt: dict) -> tuple[str, list[int] | None]:
 
     The rule, in order:
 
-    1. The dataset ships a real held-out corpus  -> evaluate `<name>_test` in full.
-       (TriviaQA, HotpotQA(+ctx) -- mirrors ACT-ViT.)
-    2. It doesn't, but we trained on it          -> evaluate the stratified slice
-       held out at train time. (TruthfulQA.)
-    3. We never trained on it                    -> zero-shot; evaluate it in full.
-       (LODO. Nothing was fit on this corpus, so every row is fair game.)
+    1. We trained on it     -> evaluate the stratified slice held out at train
+       time. (Every dataset mirrors HalluShift, which never trains/tests on
+       separate corpora.)
+    2. We never trained on it -> zero-shot; evaluate it in full.
+       (A different dataset than the checkpoint was trained on. Nothing was
+       fit on this corpus, so every row is fair game.)
 
     A `row_subset` of None means "use the whole corpus".
     """
-    base, is_test = base_name(name)
-    trained_on = {base_name(d)[0] for d in ckpt.get("train_datasets", [])}
+    trained_on = set(ckpt.get("train_datasets", []))
 
-    # Already pointed at an explicit `_test` corpus -- caller knows what they want.
-    if is_test:
+    if name not in trained_on:
+        logger.info("%s was not in this checkpoint's training set: zero-shot eval", name)
         return name, None
 
-    if base not in trained_on:
-        logger.info("%s was not in this checkpoint's training set: zero-shot eval", base)
-        return name, None
-
-    if base in HAS_TEST_CORPUS:
-        logger.info("%s has a held-out corpus; evaluating %s_test", base, base)
-        return f"{base}_test", None
-
-    logger.info("%s has no separate test corpus; evaluating its held-out slice", base)
+    logger.info("%s has no separate test corpus; evaluating its held-out slice", name)
     return name, list(ckpt.get("heldout_idx") or [])
 
 
@@ -193,15 +163,10 @@ METRIC_NAMES = ["auroc", "accuracy", "precision", "recall", "f1"]
 #: it is the number the baseline papers report, and it keeps the table readable.
 CSV_METRICS = ["auroc"]
 
-# Datasets are one column each; `_test` is an implementation detail of *how* we
-# evaluate, not a different dataset, so `triviaqa_test` reports under `TriviaQA`.
 DATASET_COLS = {
     "truthfulqa": "TruthfulQA",
     "triviaqa": "TriviaQA",
-    "hotpotqa": "HotpotQA",
-    "hotpotqa_with_context": "HotpotQA_with_context",
     "coqa": "CoQA",
-    "tydiqa": "TyDiQA-GP",
 }
 
 # The three LLMs HalluShift reports on (hal_detection.py:22-24). All base models.
@@ -238,21 +203,15 @@ def _save_to_results_csv(cfg: Config, dataset_name: str, metrics: dict, checkpoi
     # The model name must encode every axis that changes what the run IS, or two
     # different runs collide onto one (model, llm, metric) row and overwrite each
     # other. source/extraction_type change what was extracted; channels changes
-    # how it is regrouped for the CNNs. fusion/views round out the model. stream2
-    # adds a whole second CNN stream, so a stream2 run must not collide with an
-    # otherwise-identical single-stream one.
+    # how it is regrouped for the CNNs. fusion/views round out the model.
     source = run_extract.get("source", cfg.extract.source)
     extraction_type = run_extract.get("extraction_type", cfg.extract.extraction_type)
     channels = run_model.get("channels", cfg.model.channels)
-    stream2_enable = run_model.get("stream2", {}).get("enable", cfg.model.stream2.enable)
     model_name = (
         f"delta-QKV-{source}-{extraction_type}-{channels}-{fusion}-{''.join(views)}"
     )
-    if stream2_enable:
-        model_name += "+stream2"
 
-    base, _ = base_name(dataset_name)
-    dataset_col = DATASET_COLS.get(base, base)
+    dataset_col = DATASET_COLS.get(dataset_name, dataset_name)
 
     rows: list[dict] = []
     fieldnames = list(KEY_COLS)

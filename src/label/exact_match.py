@@ -43,7 +43,7 @@ def _as_list(value) -> list[str]:
 def correctness_substring(answer: str, gold) -> int:
     """Correct if ANY gold answer appears anywhere in the response.
 
-    Used for triviaqa (many aliases) and hotpotqa. Case-insensitive.
+    Used for triviaqa (many aliases) and truthfulqa. Case-insensitive.
     This is a lenient criterion -- it rewards a response that contains the right
     answer even when buried in surrounding text, which is what these baselines do
     (the models are prompted to answer concisely, so the response is short).
@@ -58,22 +58,18 @@ def correctness_substring(answer: str, gold) -> int:
     return 0
 
 
-# Which scorer each dataset uses. `_test` variants share their parent's scorer.
 CORRECTNESS_FN = {
     "triviaqa": correctness_substring,
-    "hotpotqa": correctness_substring,
-    "hotpotqa_with_context": correctness_substring,
     "truthfulqa": correctness_substring,
 }
 
 
 def score_exact_match(dataset_name: str, answer: str, gold) -> tuple[float, int]:
     """Returns (score, label). score is the 0/1 correctness; label = 1 - score."""
-    base = dataset_name.replace("_test", "")
-    if base not in CORRECTNESS_FN:
+    if dataset_name not in CORRECTNESS_FN:
         raise KeyError(
             f"no exact-match scorer for dataset {dataset_name!r}. "
             f"Known: {sorted(CORRECTNESS_FN)}"
         )
-    correct = CORRECTNESS_FN[base](answer, gold)
+    correct = CORRECTNESS_FN[dataset_name](answer, gold)
     return float(correct), 1 - correct

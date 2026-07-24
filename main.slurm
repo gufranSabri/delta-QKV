@@ -21,7 +21,11 @@ source "$SLURM_TMPDIR/env/bin/activate"
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_DISABLE_XET=1
 export TF_CPP_MIN_LOG_LEVEL=3
+export HF_HOME=/home/ahmedubc/scratch/hf_cache
+export HF_TOKEN=token
 
 bash scripts/install.sh --bleurt || exit 1
 
+
+# bash single-dataset_ablation.sh
 bash all-datasets_extract.sh

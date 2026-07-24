@@ -4,7 +4,7 @@
 Subcommands:
     extract   generate responses, capture Q/K/V, build and save token images
     label     recompute labels from stored responses (no re-extraction needed)
-    train     train the detector (single dataset, or leave-one-dataset-out)
+    train     train the detector on one dataset
     test      evaluate a saved checkpoint
     inspect   render token images to PNG so you can actually look at them
     cam       Grad-CAM/Eigen-CAM: where the detector looks, per image, for one example
@@ -13,11 +13,23 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
 from src.config import load_config
 from src.utils.logger import setup_logging
+
+
+def _hf_login() -> None:
+    """Log in to the Hugging Face Hub using HF_TOKEN, if set."""
+    import os
+
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        return
+
+    from huggingface_hub import login
+
+    login(token=token)
 
 
 def _overrides(args) -> dict:
@@ -55,13 +67,6 @@ def main(argv=None) -> int:
         help="override any config key, e.g. --set model.fusion=bilinear "
              "--set extract.views='[V]'",
     )
-    common.add_argument(
-        "--slurm", action="store_true",
-        help="slurm mode: disable tqdm progress bars (they spam log files "
-             "instead of redrawing in place). Auto-enabled when SLURM_JOB_ID "
-             "is set (i.e. running under sbatch/srun).",
-    )
-
     parser = argparse.ArgumentParser(
         prog="delta-QKV",
         description=__doc__,
@@ -81,10 +86,7 @@ def main(argv=None) -> int:
                    help="recompute labels from stored responses")
 
     p_tr = sub.add_parser("train", parents=[common], help="train the detector")
-    p_tr.add_argument("--train-datasets", type=str, default=None,
-                      help="comma-separated. Defaults to the config's dataset.")
-    p_tr.add_argument("--test-dataset", type=str, default=None,
-                      help="held-out dataset for zero-shot evaluation")
+    p_tr.add_argument("--dataset", default=None, help="defaults to the config's dataset")
     p_tr.add_argument("--run-name", type=str, default=None)
 
     p_te = sub.add_parser("test", parents=[common], help="evaluate a checkpoint")
@@ -125,15 +127,11 @@ def main(argv=None) -> int:
         args.config = pre.config
     # Merge, don't replace: --set may legitimately appear on both sides.
     args.set = list(pre.set or []) + [s for s in (args.set or []) if s not in (pre.set or [])]
-    args.slurm = args.slurm or pre.slurm or "SLURM_JOB_ID" in os.environ
 
     if not args.config:
         parser.error("--config is required (before or after the subcommand)")
     setup_logging()
-
-    from src.utils.progress import set_slurm_mode
-
-    set_slurm_mode(args.slurm)
+    _hf_login()
 
     cfg = load_config(args.config, overrides=_overrides(args))
 
@@ -150,12 +148,7 @@ def main(argv=None) -> int:
     elif args.cmd == "train":
         from src.train import train
 
-        train_datasets = (
-            [d.strip() for d in args.train_datasets.split(",") if d.strip()]
-            if args.train_datasets
-            else [cfg.dataset.name]
-        )
-        train(cfg, train_datasets, args.test_dataset, run_name=args.run_name)
+        train(cfg, args.dataset or cfg.dataset.name, run_name=args.run_name)
 
     elif args.cmd == "test":
         from src.test import test

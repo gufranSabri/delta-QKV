@@ -17,14 +17,7 @@ class Example:
     idx: int
 
 
-def _truncate_words(text: str, n: int) -> str:
-    """Cap context length by words. Long HotpotQA contexts would
-    otherwise dominate the prompt and slow generation to a crawl."""
-    words = text.split()
-    return " ".join(words[:n])
-
-
-def load_triviaqa(cfg, n: int, split: str = "train") -> list[Example]:
+def load_triviaqa(cfg, n: int, split: str = "validation") -> list[Example]:
     from datasets import load_dataset
 
     ds = load_dataset("trivia_qa", "rc.nocontext", split=split)
@@ -63,35 +56,15 @@ def load_truthfulqa(cfg, n: int) -> list[Example]:
         # building references (hal_detection.py:316). Including them would make
         # our labels strictly more lenient than theirs, and the AUROCs would no
         # longer be measuring the same task.
-        gold = row["best_answer"]
+        #
+        # Unconditionally `[best_answer]`, even if it's falsy -- HalluShift's
+        # `.apply(lambda row: [row])` (hal_detection.py:317) never drops it
+        # either; an empty best_answer still becomes a one-element reference
+        # list and gets BLEURT-scored like anything else, not hard-labelled.
         out.append(
             Example(
                 prompt=cfg.dataset.prompt_template.format(question=row["question"]),
-                gold=[gold] if gold else [],
-                idx=len(out),
-            )
-        )
-    return out
-
-
-def load_tydiqa(cfg, n: int, split: str = "train") -> list[Example]:
-    """TyDiQA-GP, English only -- HalluShift's `tydiqa` (hal_detection.py:64-65)."""
-    from datasets import load_dataset
-
-    ds = load_dataset("tydiqa", "secondary_task", split=split)
-    ds = ds.filter(lambda row: "english" in row["id"])
-
-    out = []
-    for row in ds:
-        if len(out) >= n:
-            break
-        context = _truncate_words(row["context"], 300)
-        out.append(
-            Example(
-                prompt=cfg.dataset.prompt_template.format(
-                    context=context, question=row["question"]
-                ),
-                gold=list(row["answers"]["text"]),
+                gold=[row["best_answer"]],
                 idx=len(out),
             )
         )
@@ -131,7 +104,9 @@ def _coqa_rows(split: str) -> list[dict]:
     return rows
 
 
-def load_coqa(cfg, n: int, split: str = "train") -> list[Example]:
+def load_coqa(cfg, n: int, split: str = "dev") -> list[Example]:
+    """Context (the accumulating story) is NOT truncated -- HalluShift's
+    `truncate_after_words` is defined but never called for any dataset."""
     out = []
     for row in _coqa_rows(split):
         if len(out) >= n:
@@ -139,7 +114,7 @@ def load_coqa(cfg, n: int, split: str = "train") -> list[Example]:
         out.append(
             Example(
                 prompt=cfg.dataset.prompt_template.format(
-                    story=_truncate_words(row["story"], 300), question=row["question"]
+                    story=row["story"], question=row["question"]
                 ),
                 # HalluShift uses `answer['text']` only, discarding the three
                 # `additional_answers` (hal_detection.py:323).
@@ -150,81 +125,33 @@ def load_coqa(cfg, n: int, split: str = "train") -> list[Example]:
     return out
 
 
-def load_hotpotqa(cfg, n: int, with_context: bool, split: str = "train") -> list[Example]:
-    from datasets import load_dataset
-
-    ds = load_dataset("hotpot_qa", "distractor", split=split)
-    out = []
-    for row in ds:
-        if len(out) >= n:
-            break
-        if with_context:
-            # Flatten the supporting paragraphs into one context block.
-            paras = ["".join(sents) for sents in row["context"]["sentences"]]
-            context = _truncate_words(" ".join(paras), 300)
-            prompt = cfg.dataset.prompt_template.format(
-                context=context, question=row["question"]
-            )
-        else:
-            prompt = cfg.dataset.prompt_template.format(question=row["question"])
-        out.append(Example(prompt=prompt, gold=row["answer"], idx=len(out)))
-    return out
-
-
 LOADERS = {
     "triviaqa": lambda cfg, n, sp: load_triviaqa(cfg, n, split=sp),
     "truthfulqa": lambda cfg, n, sp: load_truthfulqa(cfg, n),
-    "hotpotqa": lambda cfg, n, sp: load_hotpotqa(cfg, n, with_context=False, split=sp),
-    "hotpotqa_with_context": lambda cfg, n, sp: load_hotpotqa(cfg, n, with_context=True, split=sp),
     "coqa": lambda cfg, n, sp: load_coqa(cfg, n, split=sp),
-    "tydiqa": lambda cfg, n, sp: load_tydiqa(cfg, n, split=sp),
 }
 
-# Which upstream split backs the train corpus vs. the held-out `<name>_test` twin.
-#
-# This mapping is the whole point: ACT-ViT trains on the benchmark's train split
-# and evaluates on a *separately generated* corpus built from the benchmark's
-# dev/test split (ACT-ViT/utils/datasets_helper.py:281-324). Reproducing their
-# numbers means reproducing that separation. HotpotQA and TriviaQA have no public
-# labelled test split, so their dev set plays the test role -- same as ACT-ViT.
+# Which upstream split each dataset's pool is extracted from. Every dataset
+# here mirrors HalluShift EXACTLY (hal_detection.py:39-79): HalluShift loads a
+# single upstream split per dataset and carves train/eval out of *that* via a
+# stratified in-split split, rather than training on one corpus and testing on
+# another -- so there is no separate `<name>_test` corpus; make_split() carves
+# out the eval slice at train time instead.
 SPLIT_SOURCES = {
-    # NOTE on triviaqa/hotpotqa: their upstream `test` splits are UNLABELLED
-    # leaderboard blind sets, so `validation` is the real held-out set and plays
-    # the test role. Same choice ACT-ViT and HalluShift make.
-    "triviaqa": {"train": "train", "test": "validation"},
-    "hotpotqa": {"train": "train", "test": "validation"},
-    "hotpotqa_with_context": {"train": "train", "test": "validation"},
-    "coqa": {"train": "train", "test": "dev"},
-    "tydiqa": {"train": "train", "test": "validation"},
-    # TruthfulQA has exactly one split (817 rows, `validation`) and no held-out
-    # set to speak of, so there is no `truthfulqa_test`. It instead gets a
-    # stratified test slice carved out at train time -- see make_split().
+    # HalluShift loads triviaqa's `validation` split (deduped), not `train`.
+    "triviaqa": {"train": "validation"},
+    # HalluShift always loads CoQA's dev file, never the train file.
+    "coqa": {"train": "dev"},
+    # TruthfulQA has exactly one split (817 rows, `validation`).
     "truthfulqa": {"train": "validation"},
 }
 
-# Datasets with a genuine held-out corpus. `test.py` prefers `<name>_test` for
-# these and falls back to the in-split holdout for anything else.
-HAS_TEST_CORPUS = {n for n, s in SPLIT_SOURCES.items() if "test" in s}
-
 
 def load_examples(cfg) -> list[Example]:
-    name, is_test = base_name(cfg.dataset.name)
+    name = cfg.dataset.name
     if name not in LOADERS:
         raise KeyError(
-            f"no loader for dataset {cfg.dataset.name!r}. Known: {sorted(LOADERS)}"
+            f"no loader for dataset {name!r}. Known: {sorted(LOADERS)}"
         )
-    sources = SPLIT_SOURCES[name]
-    if is_test and "test" not in sources:
-        raise KeyError(
-            f"{name!r} has no held-out test corpus (it has a single upstream split). "
-            f"Evaluate on {name!r} directly; test.py will use its held-out slice."
-        )
-    split = sources["test" if is_test else "train"]
+    split = SPLIT_SOURCES[name]["train"]
     return LOADERS[name](cfg, cfg.dataset.n_samples, split)
-
-
-def base_name(dataset_name: str) -> tuple[str, bool]:
-    """Split `foo_test` into ("foo", True); anything else into (name, False)."""
-    if dataset_name.endswith("_test"):
-        return dataset_name[: -len("_test")], True
-    return dataset_name, False

@@ -12,6 +12,8 @@
 # Run ONE of these.
 
 salloc --gpus-per-node=l40s:1 --cpus-per-task=24 --mem=60G --time=3:00:00 --account=aip-lsigal
+# salloc --gpus-per-node=l40s:1 --cpus-per-task=8 --mem=16G --time=1:00:00 --account=aip-lsigal
+
 
 # Longer / bigger:
 # salloc --gpus-per-node=h100:1 --cpus-per-task=24 --mem=60G --time=3:00:00 --account=aip-lsigal
@@ -28,6 +30,8 @@ source $SLURM_TMPDIR/env/bin/activate
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_DISABLE_XET=1
 export TF_CPP_MIN_LOG_LEVEL=3
+export HF_TOKEN=token
+export HF_HOME=/home/ahmedubc/scratch/hf_cache
 
 # Core deps only -- enough for the ACT-ViT comparison (exact_match labels):
 bash scripts/install.sh --bleurt
@@ -39,6 +43,9 @@ bash scripts/install.sh --bleurt
 
 python -c "import torch; print('CUDA:', torch.cuda.is_available(), '|', torch.cuda.get_device_name())"
 
+
+bash all-datasets_extract.sh
+bash single-dataset_ablation.sh
 
 # ══════════════════════════════════════════════════════════════════════════
 # SINGLE CONFIG, STEP BY STEP
@@ -52,18 +59,13 @@ RUN="same_${LLM}_${DATASET}"
 
 # ── STEP 2: EXTRACT ────────────────────────────────────────────────────────
 # Generates responses, hooks q_proj/k_proj/v_proj, builds the token images.
-# The expensive step -- one generate() per example. Restartable: finished
-# examples are skipped.
+# The expensive step -- one manual decode loop per batch of examples.
+# Restartable: finished examples are skipped.
 
-python main.py --config "$CONFIG" extract
+python main.py --config "$CONFIG" extract --set extract.batch_size=16
 
 # Split across jobs if needed (1-indexed blocks of 1000):
-# python main.py --config "$CONFIG" extract --chunk 1     # examples 0-999
-
-# The HELD-OUT test corpus, built from the benchmark's dev/test split. This is
-# what same-dataset numbers are scored on -- without it there is no honest test
-# set. Skip for truthfulqa, which has one split and gets a slice instead.
-python main.py --config "$CONFIG" extract --set dataset.name=${DATASET}_test
+# python main.py --config "$CONFIG" extract --chunk 1 --set extract.batch_size=16   # examples 0-999
 
 
 # ── STEP 3: INSPECT (do this before training, on day one) ──────────────────
@@ -79,9 +81,8 @@ python main.py --config "$CONFIG" train --run-name "$RUN"
 
 
 # ── STEP 5: TEST ───────────────────────────────────────────────────────────
-# Pass the plain dataset name. `test` resolves the target itself: the
-# <ds>_test corpus where one exists, otherwise the held-out slice.
-# Writes docs/results.csv.
+# Pass the plain dataset name. `test` evaluates the held-out slice carved out
+# at train time. Writes docs/results.csv.
 
 python main.py --config "$CONFIG" test --checkpoint "runs/$RUN/best.pt" --dataset "$DATASET"
 

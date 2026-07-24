@@ -8,7 +8,6 @@ at -- that is the fusion module's job.
 
 from __future__ import annotations
 
-from .masked import MaskedPoolBackbone
 from .resnet18 import IMAGENET_SIZE, ResNet18Adapted
 from .scratch_cnn import IN_CHANNELS, ResBlock, ScratchCNN
 
@@ -18,7 +17,6 @@ __all__ = [
     "ResBlock",
     "ScratchCNN",
     "ResNet18Adapted",
-    "MaskedPoolBackbone",
     "build_backbone",
 ]
 

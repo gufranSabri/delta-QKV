@@ -161,14 +161,6 @@ def run_cam(
     cfg.extract.views = ckpt["views"]
     cfg.model.channels = ckpt.get("channels", "default")
     cfg.model.include = ckpt.get("include", None)
-    cfg.model.stream2.enable = ckpt.get("stream2_enable", False)
-    cfg.model.stream2.include = ckpt.get("stream2_include", None)
-
-    if cfg.model.stream2.enable:
-        raise NotImplementedError(
-            "CAM only covers stream 1 (the per-token image stream); "
-            "this checkpoint has stream2 enabled."
-        )
 
     name = dataset_name or cfg.dataset.name
     batch, source = _load_example(cfg, ckpt, name, idx)

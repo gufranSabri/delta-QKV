@@ -25,9 +25,10 @@ channels. For source=qkv that keeps "drop a view" (extract.views: [Q]) a pure
 slicing operation requiring no re-extraction, and it is what lets each view get
 its own CNN. For source=hs there is exactly one view (H), so V == 1.
 
-Extraction is the expensive step (one generate() per example), so it is
-restartable: an example whose directory already contains tokens.npy is skipped
-unless --overwrite is passed.
+Extraction is the expensive step (one manual decode loop per BATCH of examples,
+extract.batch_size at a time -- see qkv_hooks.left_pad_batch/capture_qkv), so it
+is restartable: an example whose directory already contains tokens.npy is
+skipped unless --overwrite is passed.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ import torch
 
 from src.config import Config
 from src.extract.datasets import load_examples
-from src.extract.qkv_hooks import capture_hidden, capture_qkv, read_geometry
+from src.extract.qkv_hooks import capture_hidden, capture_qkv, left_pad_batch, read_geometry
 from src.extract.tensor_ops import build_view_image, pool_layer_axis
 from src.label.registry import label_examples
 from src.utils.logger import get_logger
@@ -68,14 +69,13 @@ def load_llm(cfg: Config):
     return model, tokenizer
 
 
-def resolve_stop_tokens(tokenizer, model, model_name: str) -> list[int]:
+def resolve_stop_tokens(tokenizer, model) -> list[int]:
     """Every id that should terminate generation.
 
-    `tokenizer.eos_token_id` returns a SINGLE id, but instruct models stop on a
-    different token than their base counterpart -- Llama-3-Instruct ends turns
-    with <|eot_id|>, not <|end_of_text|>. Relying on eos_token_id alone means the
-    model never stops, every response runs to max_new_tokens, and the tail of
-    each image tensor is post-answer filler. So we gather every plausible stop id.
+    `tokenizer.eos_token_id` only, matching HalluShift exactly (it passes
+    `pad_token_id=tokenizer.eos_token_id` and nothing else, hal_detection.py's
+    `model.generate` calls). No chat-template end-of-turn ids, no base-model
+    newline heuristic -- those made generations diverge from HalluShift's.
     """
     ids: set[int] = set()
 
@@ -87,59 +87,23 @@ def resolve_stop_tokens(tokenizer, model, model_name: str) -> list[int]:
         else:
             ids.add(int(source))
 
-    # Chat-template end-of-turn tokens, which are what instruct models actually
-    # emit and which are frequently absent from eos_token_id.
-    #
-    # Note: some tokenizers raise AttributeError (rather than returning None) for
-    # attributes they do not define, so every lookup here is defensive. A crash
-    # in stop-token resolution would take down a multi-hour extraction run.
-    try:
-        unk = tokenizer.unk_token_id
-    except (AttributeError, KeyError):
-        unk = None
-    for token in ("<|eot_id|>", "<|end_of_turn|>", "<|im_end|>"):
-        try:
-            tid = tokenizer.convert_tokens_to_ids(token)
-        except (AttributeError, KeyError):
-            continue
-        if tid is None or tid < 0 or (unk is not None and tid == unk):
-            continue
-        ids.add(int(tid))
-
-    # Base (non-instruct) models never emit a chat stop token and will happily
-    # ramble into a new question, so both baselines cut them off at a newline.
-    if "instruct" not in model_name.lower() and "-it" not in model_name.lower():
-        try:
-            newline = tokenizer.encode("\n", add_special_tokens=False)
-        except (AttributeError, KeyError):
-            newline = []
-        if newline:
-            ids.add(int(newline[-1]))
-
     return sorted(ids)
 
 
-def build_prompt_ids(prompt: str, tokenizer, model_name: str, device) -> torch.Tensor:
+def build_prompt_ids(prompt: str, tokenizer, device) -> torch.Tensor:
     """Tokenise a prompt to a (1, prompt_len) LongTensor of input ids.
 
-    Instruct models expect their chat template; base models take raw text.
+    Raw text for every model, instruct or not -- HalluShift never applies a
+    chat template (hal_detection.py always calls plain `tokenizer(prompt)`,
+    even for instruct checkpoints), and reproducing its numbers means
+    reproducing that choice, not "fixing" it.
 
-    Both `tokenizer(...)` and `apply_chat_template(...)` may hand back either a
-    bare tensor or a dict-like BatchEncoding depending on the transformers
-    version (v5 changed apply_chat_template's return type), so we normalise
+    `tokenizer(...)` may hand back either a bare tensor or a dict-like
+    BatchEncoding depending on the transformers version, so we normalise
     rather than assuming. Getting a BatchEncoding where a tensor was expected
     fails later and confusingly, at `.ndim`.
     """
-    is_instruct = "instruct" in model_name.lower() or "-it" in model_name.lower()
-
-    if is_instruct and getattr(tokenizer, "chat_template", None):
-        out = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            return_tensors="pt",
-            add_generation_prompt=True,
-        )
-    else:
-        out = tokenizer(prompt, return_tensors="pt")
+    out = tokenizer(prompt, return_tensors="pt")
 
     # Normalise BatchEncoding / dict -> tensor.
     if not isinstance(out, torch.Tensor):
@@ -324,8 +288,9 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
         geom = read_geometry(model)
         device = next(model.parameters()).device
         logger.info("model geometry: %s", geom)
+        logger.info("extraction batch_size: %d", max(1, cfg.extract.batch_size))
 
-        stop_ids = resolve_stop_tokens(tokenizer, model, cfg.llm.name)
+        stop_ids = resolve_stop_tokens(tokenizer, model)
         logger.info(
             "stop tokens: %s (%s)",
             stop_ids,
@@ -372,70 +337,90 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
 
         save_dtype = DTYPES[cfg.extract.dtype]
 
+        # Padding token for left_pad_batch: HalluShift's own convention is
+        # `pad_token_id=tokenizer.eos_token_id` (hal_detection.py), and padded
+        # positions are excluded from attention by the mask anyway, so which
+        # id fills them is otherwise arbitrary.
+        pad_id = tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            raise ValueError(
+                f"{cfg.llm.name} has neither eos_token_id nor pad_token_id; "
+                "cannot left-pad a batch."
+            )
+
         # Plain-text progress log next to geometry.json: one line every 100
-        # examples ("i/total"). tqdm (via progress()) is a no-op under --slurm
-        # (see src/utils/progress.py), so on a cluster this is otherwise the
-        # only way to see how far a long extraction has gotten without
-        # tailing a log file full of generation internals.
+        # examples ("i/total"), so a long extraction's progress can be checked
+        # without tailing a log file full of generation internals.
         progress_log = (root / "progress.log").open("a")
         total_to_generate = len(to_generate)
+        batch_size = max(1, cfg.extract.batch_size)
+        batches = [
+            to_generate[i : i + batch_size]
+            for i in range(0, len(to_generate), batch_size)
+        ]
 
-        for i, ex in enumerate(
-            progress(to_generate, desc=f"extract {cfg.dataset.name}/{cfg.llm.alias}", ncols=100),
-            start=1,
-        ):
-            out_dir = root / f"{ex.idx:05d}"
-            input_ids = build_prompt_ids(ex.prompt, tokenizer, cfg.llm.name, device)
+        n_done = 0
+        for batch in progress(batches, desc=f"extract {cfg.dataset.name}/{cfg.llm.alias}", ncols=100):
+            prompt_ids = [build_prompt_ids(ex.prompt, tokenizer, device) for ex in batch]
+            input_ids, attention_mask = left_pad_batch(prompt_ids, pad_id, device)
 
             if cfg.extract.source == "hs":
-                qkv, gen_ids = capture_hidden(
+                batch_out = capture_hidden(
                     model,
                     input_ids,
                     max_new_tokens=cfg.dataset.max_new_tokens,
                     eos_token_id=stop_ids,
+                    attention_mask=attention_mask,
                 )
             else:
-                qkv, gen_ids = capture_qkv(
+                batch_out = capture_qkv(
                     model,
                     input_ids,
                     views=tuple(cfg.extract.views),
                     max_new_tokens=cfg.dataset.max_new_tokens,
                     eos_token_id=stop_ids,
+                    attention_mask=attention_mask,
                 )
 
-            if gen_ids.numel() == 0:
-                logger.warning("example %d generated nothing; skipping", ex.idx)
-                continue
+            for ex, (qkv, gen_ids) in zip(batch, batch_out):
+                n_done += 1
+                out_dir = root / f"{ex.idx:05d}"
 
-            response = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                if gen_ids.numel() == 0:
+                    logger.warning("example %d generated nothing; skipping", ex.idx)
+                    continue
 
-            # Truncate to max_tokens BEFORE building images: this caps both compute
-            # and disk. The response text is left whole so the label reflects what
-            # the model actually said.
-            if cfg.extract.max_tokens and qkv[cfg.extract.views[0]].shape[0] > cfg.extract.max_tokens:
-                qkv = {v: t[: cfg.extract.max_tokens] for v, t in qkv.items()}
+                response = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-            images = build_images(qkv, cfg, n_cols=n_cols)
+                # Truncate to max_tokens BEFORE building images: this caps both
+                # compute and disk. The response text is left whole so the label
+                # reflects what the model actually said.
+                if cfg.extract.max_tokens and qkv[cfg.extract.views[0]].shape[0] > cfg.extract.max_tokens:
+                    qkv = {v: t[: cfg.extract.max_tokens] for v, t in qkv.items()}
 
-            records.append(
-                {
-                    "idx": ex.idx,
-                    "dir": out_dir.name,
-                    "n_tokens": int(images.shape[0]),
-                    "prompt": ex.prompt,
-                    "response": response,
-                    "gold": ex.gold,
-                }
-            )
-            # Written after labeling below; stash the tensor path for now.
-            write_example(
-                out_dir, images, ex.prompt, response, ex.gold,
-                score=float("nan"), label=-1, save_dtype=save_dtype,
-            )
+                images = build_images(qkv, cfg, n_cols=n_cols)
 
-            if i % 100 == 0 or i == total_to_generate:
-                progress_log.write(f"{i}/{total_to_generate}\n")
-                progress_log.flush()
+                records.append(
+                    {
+                        "idx": ex.idx,
+                        "dir": out_dir.name,
+                        "n_tokens": int(images.shape[0]),
+                        "prompt": ex.prompt,
+                        "response": response,
+                        "gold": ex.gold,
+                    }
+                )
+                # Written after labeling below; stash the tensor path for now.
+                write_example(
+                    out_dir, images, ex.prompt, response, ex.gold,
+                    score=float("nan"), label=-1, save_dtype=save_dtype,
+                )
+
+                if n_done % 100 == 0 or n_done == total_to_generate:
+                    progress_log.write(f"{n_done}/{total_to_generate}\n")
+                    progress_log.flush()
 
         progress_log.close()
     elif reused:

@@ -1,5 +1,5 @@
-DATASET=tydiqa
-MODEL=qwen2.5_1.5b
+DATASET=triviaqa
+MODEL=llama2_7b
 
 # ============================================================================
 # Extraction: qkv (Q/K/V projections) AND hs (hidden states) for this dataset.
@@ -7,8 +7,8 @@ MODEL=qwen2.5_1.5b
 # bottom reads the hs one. Both must run before their respective train/test
 # calls -- extraction only needs to happen once per (source, dataset, model).
 # ============================================================================
-python main.py --config configs/$DATASET/$MODEL.yaml extract
-python main.py --config configs/$DATASET/$MODEL.yaml extract --set extract.source=hs --set "extract.views=[H]"
+# python main.py --config configs/$DATASET/$MODEL.yaml extract --set extract.batch_size=16
+# python main.py --config configs/$DATASET/$MODEL.yaml extract --set extract.source=hs --set "extract.views=[H]" --set extract.batch_size=16
 
 # ============================================================================
 # Ablation (qkv source): every (channels, include) combination.
@@ -21,8 +21,8 @@ python main.py --config configs/$DATASET/$MODEL.yaml extract --set extract.sourc
 #   null, [0], [0,1], [1], [2], [1,2]
 # ============================================================================
 
-for CHANNELS in same default; do
-  for INCLUDE_LABEL in null 0 01 1 2 12; do
+for CHANNELS in default same; do
+  for INCLUDE_LABEL in 0 01 1 2 12 null; do
     case $INCLUDE_LABEL in
       null) INCLUDE=null ;;
       0)    INCLUDE='[0]' ;;
@@ -33,7 +33,7 @@ for CHANNELS in same default; do
     esac
 
     RUN_NAME=same_${MODEL}_${DATASET}_channels-${CHANNELS}_include-${INCLUDE_LABEL}
-    python main.py --config configs/$DATASET/$MODEL.yaml train --run-name $RUN_NAME --set model.channels=$CHANNELS --set "model.include=$INCLUDE"
+    python main.py --config configs/$DATASET/$MODEL.yaml train --run-name runs/$RUN_NAME --set model.channels=$CHANNELS --set "model.include=$INCLUDE"
     python main.py --config configs/$DATASET/$MODEL.yaml test --checkpoint "runs/${RUN_NAME}/best.pt" --dataset $DATASET --set model.channels=$CHANNELS --set "model.include=$INCLUDE"
 
     python main.py \
@@ -45,20 +45,3 @@ for CHANNELS in same default; do
       --method gradcam
   done
 done
-
-# ============================================================================
-# hs (hidden states) setting: source=hs, views=[H] -- a single view, so the
-# channels/include sweep above doesn't apply the same way. One train+test run,
-# default channels mode.
-# ============================================================================
-RUN_NAME=same_${MODEL}_${DATASET}_source-hs
-python main.py --config configs/$DATASET/$MODEL.yaml train --run-name $RUN_NAME --set extract.source=hs --set "extract.views=[H]"
-python main.py --config configs/$DATASET/$MODEL.yaml test --checkpoint "runs/${RUN_NAME}/best.pt" --dataset $DATASET --set extract.source=hs --set "extract.views=[H]"
-
-python main.py \
-  --config configs/$DATASET/$MODEL.yaml \
-  cam \
-  --checkpoint runs/${RUN_NAME}/best.pt \
-  --dataset $DATASET \
-  --idx 0 \
-  --method gradcam

@@ -34,13 +34,9 @@ class QKVImageDataset(Dataset):
         origin: str | None = None,
         channels: str = "default",
         include: list[int] | None = None,
-        stream2_enable: bool = False,
-        stream2_include: list[int] | None = None,
     ):
         self.channels = channels
         self.include = include
-        self.stream2_enable = stream2_enable
-        self.stream2_include = stream2_include
         self.root = Path(root)
         manifest = self.root / "manifest.jsonl"
         if not manifest.exists():
@@ -108,13 +104,7 @@ class QKVImageDataset(Dataset):
         return images
 
     def _finish(self, raw: torch.Tensor, include: list[int] | None) -> torch.Tensor:
-        """normalize -> channels-to-conv-position -> regroup -> include.
-
-        `raw` is (*, V, L, D, 3) for stream 1 or (*, V, L, T, 3) for stream 2
-        (T and D swapped) -- this stage is agnostic to which axis is which,
-        it only cares about (V, ., ., 3) axis POSITIONS, matching
-        regroup_channels' own contract.
-        """
+        """normalize -> channels-to-conv-position -> regroup -> include."""
         images = raw
         if self.stats is not None:
             images = normalize(images, self.stats, self.views)
@@ -132,20 +122,8 @@ class QKVImageDataset(Dataset):
     def __getitem__(self, i):
         rec = self.records[i]
         raw = self._load_raw(i)                       # (T, V, L, D, 3)
-
-        images1 = self._finish(raw, self.include)
-
-        if not self.stream2_enable:
-            return images1, float(rec["label"]), self.origin
-
-        # Stream 2: T (generated tokens) becomes a spatial axis instead of the
-        # sequence axis; D (a fixed extract.n_cols for this run) takes T's old
-        # place as the axis folded into the batch by the model.
-        # raw is (T, V, L, D, 3) -> (D, V, L, T, 3).
-        raw2 = raw.permute(3, 1, 2, 0, 4)
-        images2 = self._finish(raw2, self.stream2_include)
-
-        return images1, images2, float(rec["label"]), self.origin
+        images = self._finish(raw, self.include)
+        return images, float(rec["label"]), self.origin
 
 
 def n_images(mode: str, n_views: int, include: list[int] | None = None) -> int:
@@ -242,16 +220,7 @@ def normalize(images: torch.Tensor, stats: dict, views: list[str]) -> torch.Tens
 
 
 def _set_stats(dataset, stats) -> None:
-    """Attach stats to a source, or to every source inside a concat.
-
-    A ConcatQKVDataset holds no images itself -- its children do -- so the stats
-    have to be pushed down to each of them.
-    """
-    if hasattr(dataset, "datasets"):        # ConcatQKVDataset
-        for d in dataset.datasets:
-            d.stats = stats
-    else:
-        dataset.stats = stats
+    dataset.stats = stats
 
 
 def compute_stats(
@@ -329,104 +298,20 @@ def _pad_stack(images_list: list[torch.Tensor], var_dim: int):
 def collate(batch):
     """Pad a batch of variable-length responses and build the mask.
 
-    Stream 1's images are (T, V, 3, L, C) -- T (generated tokens) varies per
-    example and is padded/masked on axis 0. When stream 2 is enabled, each
-    item is a 4-tuple and stream 2's images are (D, V, 3, L, T) -- T is now
-    the LAST axis (D, a fixed extract.n_cols, is constant across a run and
-    never needs padding), so it gets its own pad/mask pass on that axis.
+    Images are (T, V, 3, L, C) -- T (generated tokens) varies per example and
+    is padded/masked on axis 0.
 
-    Returns (stream2 disabled):
+    Returns:
         images: (B, T_max, V, 3, L, C)
         labels: (B,)
         mask:   (B, T_max) bool -- True at real tokens
         origins: list[str]
-
-    Returns (stream2 enabled):
-        images1, images2, labels, mask1, mask2, origins
     """
-    if len(batch[0]) == 3:
-        images_list, labels, origins = zip(*batch)
-        images, mask = _pad_stack(list(images_list), var_dim=0)
-        return (
-            images,
-            torch.tensor(labels, dtype=torch.float32),
-            mask,
-            list(origins),
-        )
-
-    images1_list, images2_list, labels, origins = zip(*batch)
-    images1, mask1 = _pad_stack(list(images1_list), var_dim=0)
-    # images2: (D, V, 3, L, T) -- T is the last axis (index 4).
-    images2, mask2 = _pad_stack(list(images2_list), var_dim=4)
-
+    images_list, labels, origins = zip(*batch)
+    images, mask = _pad_stack(list(images_list), var_dim=0)
     return (
-        images1,
-        images2,
+        images,
         torch.tensor(labels, dtype=torch.float32),
-        mask1,
-        mask2,
+        mask,
         list(origins),
     )
-
-
-class ConcatQKVDataset(Dataset):
-    """Concatenate several (dataset, LLM) sources for multi-dataset training.
-
-    Used by the leave-one-dataset-out setting: train on the union of N-1 sources,
-    test on the held-out one. Each item keeps its `origin` tag so metrics can be
-    reported per source, the way ACT-ViT does.
-    """
-
-    def __init__(self, datasets: list[QKVImageDataset]):
-        if not datasets:
-            raise ValueError("ConcatQKVDataset needs at least one dataset")
-
-        # All sources must agree on image geometry, or the CNN cannot consume
-        # them. Cross-LLM training therefore requires extract.l_eff to be set to
-        # a common value (Llama has 32 layers, Qwen 28).
-        shapes = {tuple(d.geometry.get("views", [])) for d in datasets}
-        if len(shapes) > 1:
-            raise ValueError(f"sources disagree on views: {shapes}")
-
-        rows = {(d.geometry.get("n_rows"), d.geometry.get("n_cols")) for d in datasets}
-        if len(rows) > 1:
-            raise ValueError(
-                f"sources have different image sizes {rows}. Cross-LLM training "
-                "requires a common image size: set extract.l_eff (and n_cols) to "
-                "the same value for every LLM and re-extract."
-            )
-
-        self.datasets = datasets
-        self.offsets = [0]
-        for d in datasets:
-            self.offsets.append(self.offsets[-1] + len(d))
-        self.views = datasets[0].views
-
-    def __len__(self) -> int:
-        return self.offsets[-1]
-
-    @property
-    def labels(self) -> list[int]:
-        out: list[int] = []
-        for d in self.datasets:
-            out.extend(d.labels)
-        return out
-
-    def _locate(self, i: int) -> tuple[QKVImageDataset, int]:
-        """Which child dataset global index `i` falls into, and its local index."""
-        lo, hi = 0, len(self.datasets) - 1
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if i >= self.offsets[mid + 1]:
-                lo = mid + 1
-            else:
-                hi = mid
-        return self.datasets[lo], i - self.offsets[lo]
-
-    def __getitem__(self, i):
-        dataset, local_i = self._locate(i)
-        return dataset[local_i]
-
-    def _load_raw(self, i):
-        dataset, local_i = self._locate(i)
-        return dataset._load_raw(local_i)

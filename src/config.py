@@ -82,6 +82,10 @@ class ExtractConfig:
     boundary_mode: str = "zero"
     dtype: str = "float16"
     max_tokens: int = 100
+    # Examples generated together per batch. >1 left-pads prompts to the
+    # batch's longest one and tracks per-sequence EOS -- purely a throughput
+    # knob, produces the same tensors as batch_size=1 (see qkv_hooks.py).
+    batch_size: int = 1
     # Number of image columns. `null` in YAML -> use the model's layer count,
     # which makes the image square (the whole point of the design).
     n_cols: int | None = None
@@ -98,21 +102,6 @@ class LabelingConfig:
 
 
 @dataclass
-class Stream2Config:
-    # Stream 2 transposes each (T, L, D) image to (D, L, T) before the same
-    # channels/regroup pipeline stream 1 uses -- T (generated tokens) becomes
-    # a spatial axis instead of the sequence axis, so the model can find
-    # "this happens over these tokens" structure directly inside a CNN. D
-    # (a fixed extract.n_cols per run) takes T's old role as the axis folded
-    # into the batch. Off by default: existing configs/checkpoints are
-    # single-stream and unaffected.
-    enable: bool = False
-    # Same semantics as model.include, but selects among stream 2's own
-    # regrouped images (same `channels` mode, independent selection).
-    include: list[int] | None = None
-
-
-@dataclass
 class ModelConfig:
     backbone: str = "scratch_cnn"
     # How the extracted views/channels are regrouped into images. See
@@ -124,7 +113,6 @@ class ModelConfig:
     # them. E.g. under channels=same (3 images: raw, ch1, ch2), include=[0, 2]
     # drops the middle image and leaves the model with 2 CNN streams.
     include: list[int] | None = None
-    stream2: Stream2Config = field(default_factory=Stream2Config)
     share_backbone: bool = False
     embed_dim: int = 128       # E: per-view CNN output
     fusion: str = "gated"
@@ -157,10 +145,11 @@ class TrainConfig:
     patience: int = 8
     seed: int = 42            # matches ACT-ViT's RANDOM_STATE and HalluShift's
     num_workers: int = 4
-    val_fraction: float = 0.2
-    # Only used for datasets with no separate held-out corpus (TruthfulQA).
-    # Everything else tests on a `<name>_test` corpus, so it needs no slice.
-    test_fraction: float = 0.2
+    # Matches HalluShift's test_size for truthfulqa/triviaqa/coqa
+    # (hal_detection.py:386) -- every supported dataset carves its held-out
+    # slice out of a single upstream split, same as HalluShift does.
+    val_fraction: float = 0.25
+    test_fraction: float = 0.25
     # Weight the positive (hallucination) class to counter imbalance.
     balance_classes: bool = True
 
@@ -275,15 +264,7 @@ class Config:
                 )
 
         _check_include(m.include, "model.include")
-        _check_include(m.stream2.include, "model.stream2.include")
 
-        if m.stream2.enable and m.backbone == "resnet18":
-            raise ValueError(
-                "model.stream2.enable=true is not supported with backbone=resnet18: "
-                "torchvision's resnet18 internals aren't decomposable the way "
-                "scratch_cnn's are, which stream 2's masked pooling needs. "
-                "Use backbone=scratch_cnn, or disable stream2."
-            )
         if m.fusion not in VALID_FUSIONS:
             raise ValueError(f"model.fusion must be one of {VALID_FUSIONS}")
         if la.scheme not in VALID_SCHEMES:
@@ -344,11 +325,6 @@ def _build(raw: dict) -> Config:
             raise ValueError(
                 f"unknown key(s) in '{name}': {sorted(unknown)}. Valid: {sorted(known)}"
             )
-        # model.stream2 is a nested dataclass; YAML gives it to us as a plain
-        # dict, which must be converted explicitly or it would silently stick
-        # around as a dict and break attribute access (cfg.model.stream2.enable).
-        if cls is ModelConfig and isinstance(section.get("stream2"), dict):
-            section["stream2"] = Stream2Config(**section["stream2"])
         kwargs[name] = cls(**section)
 
     for top in ("data_root", "runs_root"):

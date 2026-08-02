@@ -18,8 +18,9 @@ VALID_VIEWS = ("Q", "K", "V")
 VALID_BACKBONES = ("scratch_cnn", "resnet18")
 VALID_FUSIONS = ("gated", "concat_mlp", "bilinear", "cross_attn")
 
-#: What activation the images are built from. This is an EXTRACTION-time choice --
-#: it changes what is captured and therefore lives in a different data folder.
+#: What activation the images are built from. `extract` always captures and
+#: writes BOTH (see src/extract/run_extraction.py), so this field only selects
+#: which data folder `train`/`test`/`cam`/`inspect` read from:
 #:
 #:   qkv  per-layer Q/K/V projection activations, captured via forward hooks.
 #:        Produces one "view" per entry in extract.views (Q, K, V).
@@ -28,9 +29,9 @@ VALID_FUSIONS = ("gated", "concat_mlp", "bilinear", "cross_attn")
 #:        always yields a single image ("view").
 VALID_SOURCES = ("qkv", "hs")
 
-#: How each view's per-layer signal is turned into the 3 image channels. Also an
-#: EXTRACTION-time choice (different channels are written to disk), so it too
-#: partitions the data folder.
+#: How each view's per-layer signal is turned into the 3 image channels. Like
+#: `source`, `extract` always builds and writes BOTH, so this only selects
+#: which data folder `train`/`test`/`cam`/`inspect` read from:
 #:
 #:   delta       (raw, delta-to-prev-layer, delta-to-next-layer). The original
 #:               design: how the representation changes between adjacent layers.
@@ -72,8 +73,9 @@ class DatasetConfig:
 
 @dataclass
 class ExtractConfig:
-    # What to capture and how to turn it into channels. Both are EXTRACTION-time
-    # choices that change what lands on disk, so they partition the data folder:
+    # `extract` always captures and writes every (source, extraction_type)
+    # combination in one run (see src/extract/run_extraction.py); these two
+    # fields only select which existing data folder train/test/cam/inspect read:
     #   data/{source}/{extraction_type}/{dataset}/{llm_alias}/
     source: str = "qkv"                 # qkv | hs   (VALID_SOURCES)
     extraction_type: str = "delta"      # delta | transforms (VALID_EXTRACTION_TYPES)
@@ -176,10 +178,20 @@ class Config:
         LLM produces genuinely different tensors under each, so they must not
         collide in one directory.
         """
+        return self.example_dir_for(self.extract.source, self.extract.extraction_type, root=root)
+
+    def example_dir_for(self, source: str, extraction_type: str, root: str | None = None) -> Path:
+        """`example_dir`, for an explicit (source, extraction_type) pair.
+
+        Extraction always populates every (source, extraction_type) combination
+        in one run (see run_extraction.run_extraction), so it needs every
+        combo's path up front rather than only the one `cfg.extract` currently
+        points at -- that is what this generalises `example_dir` to.
+        """
         return (
             Path(root or self.data_root)
-            / self.extract.source
-            / self.extract.extraction_type
+            / source
+            / extraction_type
             / self.dataset.name
             / self.llm.alias
         )

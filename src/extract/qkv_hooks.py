@@ -50,7 +50,7 @@ the prompt's, not the response's, and are discarded.
 
 CAVEAT: this assumes `use_cache=True` (the default). With `use_cache=False` every
 decode step re-runs the full sequence and the hook fires with seq = prompt+t, so
-we would have to slice out the last position. `capture_qkv` asserts on this
+we would have to slice out the last position. `capture_all` asserts on this
 rather than silently producing garbage.
 """
 
@@ -162,7 +162,12 @@ def read_geometry(model) -> ModelGeometry:
 
 def get_decoder_layers(model) -> nn.ModuleList:
     """Locate the ModuleList of decoder layers across model wrappers."""
-    for path in ("model.layers", "model.model.layers", "transformer.h"):
+    for path in (
+        "model.layers",              # Llama, Mistral, Qwen, ...
+        "model.model.layers",
+        "transformer.h",             # GPT-2 family
+        "model.decoder.layers",      # OPT
+    ):
         obj = model
         try:
             for part in path.split("."):
@@ -173,7 +178,7 @@ def get_decoder_layers(model) -> nn.ModuleList:
             return obj
     raise AttributeError(
         "could not locate decoder layers on this model; expected one of "
-        "model.layers / model.model.layers / transformer.h"
+        "model.layers / model.model.layers / transformer.h / model.decoder.layers"
     )
 
 
@@ -268,7 +273,7 @@ def qkv_hooks(model, views=VIEWS, batch_size: int = 1):
     """Attach Q/K/V projection hooks for the duration of the context.
 
     Yields the QKVCapture. Recording is OFF on entry -- call `capture.start()`
-    (via the `_recording` flag, which `capture_qkv` manages) to begin, so that a
+    (via the `_recording` flag, which `capture_all` manages) to begin, so that a
     prefill pass can be run without being recorded.
 
     Hooks are always removed on exit, including on exception.
@@ -339,7 +344,7 @@ def left_pad_batch(
 
 
 @torch.no_grad()
-def capture_qkv(
+def capture_all(
     model,
     input_ids,
     views=VIEWS,
@@ -348,7 +353,13 @@ def capture_qkv(
     pad_token_id=None,
     attention_mask: torch.Tensor | None = None,
 ) -> list[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-    """Greedy-generate and capture Q/K/V for the GENERATED tokens only.
+    """Greedy-generate and capture Q/K/V AND hidden states in ONE decode loop.
+
+    Both streams are read off the SAME forward passes (QKV via the projection
+    hooks, hidden states via `output_hidden_states=True`), so generation runs
+    exactly once regardless of how many of {qkv, hs} extraction actually wants
+    -- there is no reason to pay for two separate decode loops when every
+    forward pass already carries both.
 
     Args:
         input_ids: (B, prompt_len) LEFT-PADDED prompt token ids, on the model
@@ -357,16 +368,18 @@ def capture_qkv(
             excluded from attention.
 
     Returns:
-        A list of B (qkv, generated_ids) pairs, one per input row, in order:
-          qkv["Q"] is (T_i, L, D_q), qkv["K"] and qkv["V"] are (T_i, L, D_kv),
+        A list of B (activations, generated_ids) pairs, one per input row:
+          activations["Q"] is (T_i, L, D_q), ["K"]/["V"] are (T_i, L, D_kv),
+          activations["H"] is (T_i, L, D_hidden),
           generated_ids is (T_i,) -- that row's response tokens, prompt excluded.
         T_i is the number of tokens THAT ROW generated before its own EOS (or
         max_new_tokens) -- sequences in a batch finish at different steps, so
         T_i varies across the returned list; this is not a padded tensor.
 
     Only decode-step activations are recorded. The prefill pass -- which carries
-    the PROMPT's Q/K/V, not the response's -- is explicitly excluded by leaving
-    recording off until after the prompt has been consumed.
+    the PROMPT's activations, not the response's -- is explicitly excluded by
+    leaving QKV recording off (and discarding the prefill's hidden states) until
+    after the prompt has been consumed.
 
     We drive the decode loop by hand rather than calling `model.generate`,
     because generate() gives us no reliable hook to distinguish prefill from
@@ -382,9 +395,13 @@ def capture_qkv(
     eos_ids = _resolve_eos_ids(eos_token_id, model)
 
     with qkv_hooks(model, views=views, batch_size=B) as capture:
-        # ---- PREFILL: consume the prompt. NOT recorded. ----
+        # ---- PREFILL: consume the prompt. NOT recorded (neither QKV nor the
+        # hidden states, which are the PROMPT's, not the response's). ----
         capture._recording = False
-        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+        out = model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            use_cache=True, output_hidden_states=True,
+        )
         past = out.past_key_values
         next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (B, 1)
 
@@ -395,12 +412,13 @@ def capture_qkv(
 
         # ---- DECODE: one token at a time. Recorded. ----
         # The token fed at step t is the token GENERATED at step t-1 (or the
-        # argmax of the prompt's last logit, for t=0). So the Q/K/V captured at
-        # step t are exactly the activations the model computed *for* that
-        # generated token -- which is the correspondence we want between an
-        # image and a response token.
+        # argmax of the prompt's last logit, for t=0). So the activations
+        # captured at step t are exactly what the model computed *for* that
+        # generated token -- the correspondence we want between an image and a
+        # response token.
         capture._recording = True
         generated: list[list[int]] = [[] for _ in range(B)]
+        per_step_hidden: list[list[torch.Tensor]] = [[] for _ in range(B)]  # (L, D) per step
         finished = [False] * B
 
         for _ in range(max_new_tokens):
@@ -434,12 +452,21 @@ def capture_qkv(
                 past_key_values=past,
                 attention_mask=running_mask,
                 use_cache=True,
+                output_hidden_states=True,
             )
             past = out.past_key_values
+
+            # hidden_states: tuple of (B, 1, D_hidden), length L+1. Drop the
+            # embedding (index 0); stack layers 1..L into (L, D_hidden) per row.
+            layers = out.hidden_states[1:]
+            step = torch.stack(
+                [h[:, -1].detach().to("cpu", torch.float32) for h in layers], dim=1
+            )  # (B, L, D_hidden)
 
             for i in range(B):
                 if not finished[i]:
                     generated[i].append(int(next_token[i, 0].item()))
+                    per_step_hidden[i].append(step[i])
 
             next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
@@ -447,8 +474,10 @@ def capture_qkv(
 
     if all(not g for g in generated):
         # Every row emitted EOS immediately: no response tokens, no images.
+        empty = {v: torch.empty(0) for v in views}
+        empty[HS_VIEW] = torch.empty(0)
         return [
-            ({v: torch.empty(0) for v in views}, torch.empty(0, dtype=torch.long))
+            (dict(empty), torch.empty(0, dtype=torch.long))
             for _ in range(B)
         ]
 
@@ -457,7 +486,7 @@ def capture_qkv(
     results = []
     for i in range(B):
         n_gen = len(generated[i])
-        row_qkv = {}
+        row_out = {}
         for view in views:
             tensor = qkv_by_slot[view][i]
             if tensor.numel() > 0 and tensor.shape[0] != n_gen:
@@ -466,108 +495,11 @@ def capture_qkv(
                     f"activations but generated {n_gen} tokens. The "
                     "prefill/decode split or per-slot masking is wrong."
                 )
-            row_qkv[view] = tensor
+            row_out[view] = tensor
+        row_out[HS_VIEW] = (
+            torch.stack(per_step_hidden[i], dim=0) if per_step_hidden[i] else torch.empty(0)
+        )
         results.append(
-            (row_qkv, torch.tensor(generated[i], dtype=torch.long, device=device))
+            (row_out, torch.tensor(generated[i], dtype=torch.long, device=device))
         )
-    return results
-
-
-@torch.no_grad()
-def capture_hidden(
-    model,
-    input_ids: torch.Tensor,
-    max_new_tokens: int = 100,
-    eos_token_id=None,
-    attention_mask: torch.Tensor | None = None,
-) -> list[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-    """Greedy-generate and capture per-layer HIDDEN STATES for generated tokens.
-
-    The hidden-state analogue of `capture_qkv`. Hidden states (the residual
-    stream after each decoder layer) come for free via output_hidden_states, so
-    no forward hooks are needed -- we just read them off each decode step.
-
-    Args:
-        input_ids: (B, prompt_len) LEFT-PADDED prompts, as in `capture_qkv`.
-
-    Returns:
-        A list of B (hidden, generated_ids) pairs, one per input row, matching
-        `capture_qkv`'s per-row contract: hidden["H"] is (T_i, L, D_hidden).
-
-    `output_hidden_states` yields L+1 tensors: index 0 is the embedding output
-    (pre-layer-0), indices 1..L are the outputs of each decoder layer. We keep
-    1..L so layer l corresponds to "the residual stream AFTER layer l" -- the
-    same L-length layer axis the Q/K/V path produces.
-    """
-    if input_ids.ndim != 2:
-        raise ValueError(f"expected input_ids (B, prompt_len), got {tuple(input_ids.shape)}")
-
-    B = input_ids.shape[0]
-    device = input_ids.device
-    eos_ids = _resolve_eos_ids(eos_token_id, model)
-
-    # ---- PREFILL: consume the prompt. Its hidden states are the PROMPT's, so
-    # they are discarded; we only keep the argmax to seed decoding. ----
-    out = model(
-        input_ids=input_ids, attention_mask=attention_mask,
-        use_cache=True, output_hidden_states=True,
-    )
-    past = out.past_key_values
-    next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)  # (B, 1)
-
-    running_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
-
-    # ---- DECODE: one token at a time; keep each step's per-layer hidden state.
-    generated: list[list[int]] = [[] for _ in range(B)]
-    per_step: list[list[torch.Tensor]] = [[] for _ in range(B)]   # per row: (L, D) per step
-    finished = [False] * B
-
-    for _ in range(max_new_tokens):
-        newly_finished = [
-            (not finished[i]) and int(next_token[i, 0].item()) in eos_ids
-            for i in range(B)
-        ]
-        for i, done in enumerate(newly_finished):
-            if done:
-                finished[i] = True
-        if all(finished):
-            break
-
-        running_mask = torch.cat(
-            [running_mask, torch.ones((B, 1), dtype=torch.long, device=device)], dim=1
-        )
-        out = model(
-            input_ids=next_token,
-            past_key_values=past,
-            attention_mask=running_mask,
-            use_cache=True,
-            output_hidden_states=True,
-        )
-        past = out.past_key_values
-        # hidden_states: tuple of (B, 1, D_hidden), length L+1. Drop the
-        # embedding (index 0); stack layers 1..L into (L, D_hidden) per row.
-        layers = out.hidden_states[1:]
-        step = torch.stack(
-            [h[:, -1].detach().to("cpu", torch.float32) for h in layers], dim=1
-        )  # (B, L, D_hidden)
-
-        for i in range(B):
-            if not finished[i]:
-                generated[i].append(int(next_token[i, 0].item()))
-                per_step[i].append(step[i])
-
-        next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-
-    results = []
-    for i in range(B):
-        if not generated[i]:
-            results.append((
-                {HS_VIEW: torch.empty(0)}, torch.empty(0, dtype=torch.long)
-            ))
-            continue
-        hidden = torch.stack(per_step[i], dim=0)  # (T_i, L, D_hidden)
-        results.append((
-            {HS_VIEW: hidden},
-            torch.tensor(generated[i], dtype=torch.long, device=device),
-        ))
     return results

@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from src.config import Config
-from src.data.dataset import collate, n_images
+from src.data.dataset import collate, compute_stats, n_images
 from src.models.classifier import build_model
 from src.train import load_source, report_gates, run_epoch
 from src.utils.logger import get_logger
@@ -29,7 +29,13 @@ RESULTS_CSV = Path(
 )
 
 
-def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -> dict:
+def test(
+    cfg: Config,
+    checkpoint: str | Path,
+    dataset_name: str | None = None,
+    recompute_stats: bool = False,
+    out_name: str | None = None,
+) -> dict:
     seed_everything(cfg.train.seed)
     device = pick_device()
 
@@ -40,6 +46,23 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     views = ckpt["views"]
     stats = ckpt["stats"]
+
+    # Cross-LLM eval: cfg.llm.alias is whatever --config points at, which may
+    # differ from the LLM this checkpoint was actually trained on. Surface
+    # this loudly and unconditionally -- it silently changes what "in-
+    # distribution" even means below (see _resolve_eval_target).
+    ckpt_llm_alias = ckpt.get("llm_alias")
+    if ckpt_llm_alias is not None and ckpt_llm_alias != cfg.llm.alias:
+        logger.warning(
+            "cross-LLM eval: checkpoint was trained on llm=%r, evaluating "
+            "against llm=%r's data. Normalization stats are the CHECKPOINT's "
+            "(%s) unless --recompute-stats is passed.",
+            ckpt_llm_alias, cfg.llm.alias,
+            "will be recomputed from the target LLM's data" if recompute_stats
+            else "i.e. llm=%r's, force-applied to llm=%r's activations" % (
+                ckpt_llm_alias, cfg.llm.alias
+            ),
+        )
 
     if views != cfg.extract.views:
         logger.warning(
@@ -74,11 +97,19 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
         cfg.model.include = ckpt_include
 
     name = dataset_name or cfg.dataset.name
-    name, eval_set = _resolve_eval_target(name, ckpt)
+    name, eval_set = _resolve_eval_target(name, ckpt, cfg.llm.alias)
 
     source = load_source(cfg, name, cfg.llm.alias)
-    # Normalise with the TRAINING statistics baked into the checkpoint, never
-    # with statistics recomputed on the test set.
+    if recompute_stats:
+        # Explicit opt-in: normalise with statistics computed fresh from the
+        # TARGET corpus, instead of the checkpoint's training-LLM statistics.
+        # Meaningful only for a genuine cross-LLM eval -- for the checkpoint's
+        # own LLM/dataset this would just be a noisier reimplementation of
+        # `stats`, so passing it there is harmless but pointless.
+        logger.info("recomputing normalization stats from %s (recompute_stats=True)", source.origin)
+        stats = compute_stats(source, list(range(len(source))))
+    # Normalise with the TRAINING statistics baked into the checkpoint by
+    # default, never with statistics silently recomputed on the test set.
     source.stats = stats
 
     # Restrict to the held-out rows when the model was trained on this corpus.
@@ -121,7 +152,7 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
     if gates:
         out["view_gates"] = gates
 
-    dest = ckpt_path.parent / f"test_{name}.json"
+    dest = ckpt_path.parent / f"test_{out_name or name}.json"
     dest.write_text(json.dumps(out, indent=2))
     logger.info("wrote %s", dest)
 
@@ -133,24 +164,38 @@ def test(cfg: Config, checkpoint: str | Path, dataset_name: str | None = None) -
     return out
 
 
-def _resolve_eval_target(name: str, ckpt: dict) -> tuple[str, list[int] | None]:
+def _resolve_eval_target(
+    name: str, ckpt: dict, llm_alias: str
+) -> tuple[str, list[int] | None]:
     """Pick what to actually evaluate on. Returns (corpus_name, row_subset).
 
     The rule, in order:
 
-    1. We trained on it     -> evaluate the stratified slice held out at train
-       time. (Every dataset mirrors HalluShift, which never trains/tests on
-       separate corpora.)
-    2. We never trained on it -> zero-shot; evaluate it in full.
-       (A different dataset than the checkpoint was trained on. Nothing was
-       fit on this corpus, so every row is fair game.)
+    1. We trained on it, on THIS SAME LLM -> evaluate the stratified slice
+       held out at train time. (Every dataset mirrors HalluShift, which never
+       trains/tests on separate corpora.)
+    2. Anything else (a different dataset, OR the same dataset name but a
+       DIFFERENT LLM) -> zero-shot; evaluate the full corpus.
+       `heldout_idx` was computed against the CHECKPOINT's LLM's manifest --
+       reusing it against a different LLM's manifest would restrict the eval
+       to index positions with no real meaning for that LLM's data, so a
+       dataset-name match alone is not enough; the LLM must match too.
+       Checkpoints written before `llm_alias` existed have no recorded LLM
+       (`ckpt.get("llm_alias")` is None) and are treated as matching whatever
+       `llm_alias` is asked for, to preserve their previous behaviour.
 
     A `row_subset` of None means "use the whole corpus".
     """
     trained_on = set(ckpt.get("train_datasets", []))
+    ckpt_llm_alias = ckpt.get("llm_alias")
+    same_llm = ckpt_llm_alias is None or ckpt_llm_alias == llm_alias
 
-    if name not in trained_on:
-        logger.info("%s was not in this checkpoint's training set: zero-shot eval", name)
+    if name not in trained_on or not same_llm:
+        reason = "different LLM" if (name in trained_on and not same_llm) else "unseen dataset"
+        logger.info(
+            "%s (llm=%s) was not in this checkpoint's training set (%s): zero-shot eval",
+            name, llm_alias, reason,
+        )
         return name, None
 
     logger.info("%s has no separate test corpus; evaluating its held-out slice", name)

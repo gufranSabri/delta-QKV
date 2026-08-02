@@ -383,6 +383,11 @@ def train(
                     # the whole corpus), and recover the exact held-out rows.
                     "train_datasets": [dataset_name],
                     "heldout_idx": heldout_idx,
+                    # Which LLM this checkpoint's data came from -- lets test.py
+                    # tell a same-dataset-different-LLM eval (must NOT reuse
+                    # heldout_idx, those indices mean nothing for another LLM's
+                    # manifest) apart from a genuine in-distribution eval.
+                    "llm_alias": cfg.llm.alias,
                 },
                 run_dir / "best.pt",
             )

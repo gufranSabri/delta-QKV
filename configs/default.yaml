@@ -22,7 +22,7 @@ extract:
   boundary_mode: wrap         # zero | replicate | wrap (delta only; see tensor_ops.py)
   dtype: float16
   max_tokens: 100
-  batch_size: 1                # examples generated together; >1 is purely a speed knob
+  batch_size: 8                # examples generated together; >1 is purely a speed knob
   n_cols: null                # null -> use the model's layer count => SQUARE image
   l_eff: null                 # null -> keep the model's L. Set for cross-LLM runs.
 
@@ -44,17 +44,17 @@ model:
   channels: same                # default | first_only | same
   include: [0]                 # null (keep all) or a list of image indices to keep
   share_backbone: false       # false => one CNN per view (Q, K, V untied)
-  embed_dim: 1024              # E: per-view CNN output
+  embed_dim: 2048              # E: per-view CNN output
   fusion: concat_mlp               # gated | concat_mlp | bilinear | cross_attn
-  fused_dim: 1024              # F: fusion output
+  fused_dim: 2048              # F: fusion output
   conv1d_layers: 2
-  lstm_hidden: 1024
+  lstm_hidden: 2048
   lstm_layers: 1
   dropout: 0.3
   pretrained_backbone: true   # only used by resnet18
 
 train:
-  batch_size: 1
+  batch_size: 8
   lr: 0.0001
   weight_decay: 0.0001
   backbone_lr_scale: 0.1

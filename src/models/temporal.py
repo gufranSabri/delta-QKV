@@ -23,12 +23,17 @@ class MaskedAttentionPool(nn.Module):
         super().__init__()
         self.score = nn.Linear(dim, 1)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor, return_weights: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # x: (B, T, D), mask: (B, T) bool -- True = real token
         logits = self.score(x).squeeze(-1)                    # (B, T)
         logits = logits.masked_fill(~mask, float("-inf"))
         weights = torch.softmax(logits, dim=1).unsqueeze(-1)  # (B, T, 1)
-        return (weights * x).sum(dim=1)                       # (B, D)
+        pooled = (weights * x).sum(dim=1)                     # (B, D)
+        if return_weights:
+            return pooled, weights.squeeze(-1)                # (B, D), (B, T)
+        return pooled
 
 
 class TemporalEncoder(nn.Module):
@@ -65,7 +70,9 @@ class TemporalEncoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.out_dim = 2 * lstm_hidden
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor, return_weights: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # x: (B, T, F), mask: (B, T) bool
         if not mask.any(dim=1).all():
             # pack_padded_sequence raises an opaque error on a zero-length row.
@@ -96,5 +103,4 @@ class TemporalEncoder(nn.Module):
             packed_out, batch_first=True, total_length=mask.shape[1]
         )
 
-        pooled = self.pool(self.drop(out), mask)               # (B, 2H)
-        return pooled
+        return self.pool(self.drop(out), mask, return_weights=return_weights)

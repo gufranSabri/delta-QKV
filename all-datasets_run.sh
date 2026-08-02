@@ -1,6 +1,15 @@
 #!/bin/bash
 # Train + test every (dataset x LLM) with default settings -- no ablation
 # overrides. Run all-datasets_extract.sh first so the corpora are on disk.
+# The extract.source=hs (hidden states) comparison lives in
+# ablation_suite.sh's ablation_source() function (full 3x3 grid), not here.
+
+# RERUN=0 (default): skip a train/test call if its output already exists --
+# train is skipped when runs/$RUN_NAME/results.json exists (only written after
+# a run finishes, so a crashed/partial run is correctly NOT treated as done);
+# test is skipped when its checkpoint's test_$DATASET.json already exists.
+# RERUN=1: always run everything, overwriting prior results.
+RERUN=${RERUN:-0}
 
 DATASETS=(
     triviaqa
@@ -9,8 +18,32 @@ DATASETS=(
 )
 
 MODELS=(
-    llama2_7b
+    # llama2_7b
+    # llama3.1_8b
+    qwen2.5_7b
+    # opt_6.7b
 )
+
+# run_train <run_name> [--set key=val ...]
+run_train() {
+    local run_name="$1"; shift
+    if [[ "$RERUN" != "1" && -f "runs/${run_name}/results.json" ]]; then
+        echo "  [skip] train runs/${run_name} (results.json already exists; RERUN=1 to force)"
+        return
+    fi
+    python main.py --config configs/$DATASET/$MODEL.yaml train --run-name "runs/${run_name}" "$@"
+}
+
+# run_test <run_name> [--set key=val ...]
+run_test() {
+    local run_name="$1"; shift
+    local dest="runs/${run_name}/test_${DATASET}.json"
+    if [[ "$RERUN" != "1" && -f "$dest" ]]; then
+        echo "  [skip] test runs/${run_name} ($dest already exists; RERUN=1 to force)"
+        return
+    fi
+    python main.py --config configs/$DATASET/$MODEL.yaml test --checkpoint "runs/${run_name}/best.pt" --dataset $DATASET "$@"
+}
 
 for DATASET in "${DATASETS[@]}"; do
     for MODEL in "${MODELS[@]}"; do
@@ -21,13 +54,9 @@ for DATASET in "${DATASETS[@]}"; do
         echo "========================================"
 
         RUN_NAME=same_${MODEL}_${DATASET}
-        RUN_NAME_DELTA=same_${MODEL}_${DATASET}_delta
 
-        python main.py --config configs/$DATASET/$MODEL.yaml train --run-name runs/$RUN_NAME
-        python main.py --config configs/$DATASET/$MODEL.yaml test --checkpoint "runs/${RUN_NAME}/best.pt" --dataset $DATASET
-
-        python main.py --config configs/$DATASET/$MODEL.yaml train --run-name runs/$RUN_NAME_DELTA --set extract.extraction_type=delta
-        python main.py --config configs/$DATASET/$MODEL.yaml test --checkpoint "runs/${RUN_NAME_DELTA}/best.pt" --dataset $DATASET --set extract.extraction_type=delta
+        run_train "$RUN_NAME"
+        run_test "$RUN_NAME"
 
     done
 done

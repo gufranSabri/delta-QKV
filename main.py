@@ -92,6 +92,17 @@ def main(argv=None) -> int:
     p_te = sub.add_parser("test", parents=[common], help="evaluate a checkpoint")
     p_te.add_argument("--checkpoint", required=True)
     p_te.add_argument("--dataset", default=None, help="defaults to the config's dataset")
+    p_te.add_argument(
+        "--recompute-stats", action="store_true",
+        help="normalize with stats recomputed from the eval corpus instead of "
+             "the checkpoint's training stats (for a genuine cross-LLM eval)",
+    )
+    p_te.add_argument(
+        "--out-name", default=None,
+        help="write test_<name>.json under this name instead of the dataset "
+             "name (avoids clobbering an in-distribution result, e.g. for a "
+             "cross-LLM eval reusing the same checkpoint)",
+    )
 
     p_in = sub.add_parser("inspect", parents=[common], help="render token images to PNG")
     p_in.add_argument("--idx", type=int, default=0, help="example index")
@@ -153,7 +164,10 @@ def main(argv=None) -> int:
     elif args.cmd == "test":
         from src.test import test
 
-        test(cfg, args.checkpoint, dataset_name=args.dataset)
+        test(
+            cfg, args.checkpoint, dataset_name=args.dataset,
+            recompute_stats=args.recompute_stats, out_name=args.out_name,
+        )
 
     elif args.cmd == "inspect":
         from src.inspect_images import inspect

@@ -10,7 +10,7 @@
 #SBATCH --gpus-per-node=l40s:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=60G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=12:00:00
 
 set -uo pipefail
 
@@ -26,6 +26,12 @@ export HF_TOKEN=token
 
 bash scripts/install.sh --bleurt || exit 1
 
-
-# bash single-dataset_ablation.sh
 bash all-datasets_extract.sh
+bash all-datasets_run.sh
+
+
+
+# I'm done now with the main results ig
+# i now need to run experiments to support the ablation and the discussion
+
+# i want to do analysis on what the heatmaps say ab

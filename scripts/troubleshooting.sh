@@ -58,9 +58,11 @@ RUN="same_${LLM}_${DATASET}"
 
 
 # ── STEP 2: EXTRACT ────────────────────────────────────────────────────────
-# Generates responses, hooks q_proj/k_proj/v_proj, builds the token images.
-# The expensive step -- one manual decode loop per batch of examples.
-# Restartable: finished examples are skipped.
+# Generates responses, hooks q_proj/k_proj/v_proj AND captures hidden states,
+# builds the token images for every (source, extraction_type) combination in
+# one pass -- extract.source/extraction_type only matter to train/test/cam/
+# inspect, not to this step. The expensive step -- one manual decode loop per
+# batch of examples. Restartable: finished examples are skipped.
 
 python main.py --config "$CONFIG" extract --set extract.batch_size=16
 

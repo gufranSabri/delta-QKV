@@ -1,14 +1,25 @@
 """Orchestrates feature extraction: generate -> capture activations -> build images -> save.
 
-Two extraction-time choices decide WHAT gets captured and therefore WHERE it is
-stored (they partition the data folder so they never collide):
+Two config fields, `extract.source` (qkv|hs) and `extract.extraction_type`
+(delta|transforms), decide WHAT a *train/test* run reads:
 
-  extract.source          qkv -> per-layer Q/K/V projections (forward hooks)
-                          hs  -> per-layer hidden states (residual stream)
-  extract.extraction_type delta      -> channels (raw, delta-prev, delta-next)
-                          transforms -> channels (raw, DWT, FFT) along L
+  source           qkv -> per-layer Q/K/V projections (forward hooks)
+                  hs  -> per-layer hidden states (residual stream)
+  extraction_type delta      -> channels (raw, delta-prev, delta-next)
+                  transforms -> channels (raw, DWT, FFT) along L
 
-On-disk layout, per (source, extraction_type, dataset, LLM):
+EXTRACTION ignores both. A single `extract` run generates each example ONCE
+(one manual decode loop per batch, capturing Q/K/V and hidden states together
+in the same forward passes -- see qkv_hooks.capture_all) and then builds and
+writes ALL FOUR (source x extraction_type) combinations, so nothing needs to
+be generated twice and no separate `--set extract.source=...` invocation is
+needed to get the other combos. Labeling likewise runs ONCE per example (the
+response text is identical across all four combos) and the resulting
+score/label is copied into all four directories.
+
+On-disk layout is unchanged from before this: still one tree per
+(source, extraction_type, dataset, LLM), so train/test/cam/inspect need no
+changes at all --
 
     data/{source}/{extraction_type}/{dataset}/{llm_alias}/
         00000/
@@ -20,29 +31,36 @@ On-disk layout, per (source, extraction_type, dataset, LLM):
         geometry.json       the model geometry the images were built with
         progress.log        "i/total" appended every 100 generated examples
 
+-- just that `extract` now populates all four trees from one generation pass
+instead of requiring four separate `python main.py extract` invocations.
+
 The view axis V is a REAL axis in the stored array -- it is never folded into
 channels. For source=qkv that keeps "drop a view" (extract.views: [Q]) a pure
 slicing operation requiring no re-extraction, and it is what lets each view get
 its own CNN. For source=hs there is exactly one view (H), so V == 1.
 
-Extraction is the expensive step (one manual decode loop per BATCH of examples,
-extract.batch_size at a time -- see qkv_hooks.left_pad_batch/capture_qkv), so it
-is restartable: an example whose directory already contains tokens.npy is
-skipped unless --overwrite is passed.
+Extraction is the expensive step, so it is restartable: an example already
+complete in EVERY combo's directory is skipped unless --overwrite is passed.
+When EVERY requested example is already complete, this is detected from
+manifest.jsonl alone -- before load_examples() (may hit the network/HF hub)
+or load_llm() (loads the whole model onto a GPU) ever run -- so re-invoking
+`extract` on an already-finished (dataset, LLM) is cheap, not just correct.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from itertools import product
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from src.config import Config
+from src.config import VALID_EXTRACTION_TYPES, VALID_SOURCES
 from src.extract.datasets import load_examples
-from src.extract.qkv_hooks import capture_hidden, capture_qkv, left_pad_batch, read_geometry
+from src.extract.qkv_hooks import HS_VIEW, VIEWS, capture_all, left_pad_batch, read_geometry
 from src.extract.tensor_ops import build_view_image, pool_layer_axis
 from src.label.registry import label_examples
 from src.utils.logger import get_logger
@@ -51,6 +69,15 @@ from src.utils.progress import progress
 logger = get_logger(__name__)
 
 DTYPES = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
+
+#: Every (source, extraction_type) combination extraction populates in one run.
+#: Order matches VALID_SOURCES x VALID_EXTRACTION_TYPES; not meaningful beyond
+#: giving a stable iteration order for logging.
+COMBOS: list[tuple[str, str]] = list(product(VALID_SOURCES, VALID_EXTRACTION_TYPES))
+
+#: Views captured/stored per source. qkv gets the real Q/K/V projections; hs
+#: gets the single hidden-state stream, exactly as VALID_SOURCES documents.
+VIEWS_FOR_SOURCE: dict[str, tuple[str, ...]] = {"qkv": VIEWS, "hs": (HS_VIEW,)}
 
 
 def load_llm(cfg: Config):
@@ -116,26 +143,30 @@ def build_prompt_ids(prompt: str, tokenizer, device) -> torch.Tensor:
 
 
 def build_images(
-    qkv: dict[str, torch.Tensor],
+    activations: dict[str, torch.Tensor],
     cfg: Config,
     n_cols: int,
+    source: str,
+    extraction_type: str,
 ) -> torch.Tensor:
-    """Turn captured raw activations into the stored image tensor.
+    """Turn captured raw activations into the stored image tensor for one
+    (source, extraction_type) combo.
 
     Args:
-        qkv: source=qkv -> {"Q": (T, L, D_q), "K"/"V": (T, L, D_kv)}
-             source=hs  -> {"H": (T, L, D_hidden)}
+        activations: {"Q": (T, L, D_q), "K"/"V": (T, L, D_kv), "H": (T, L, D_hidden)}
+            -- everything `capture_all` captured; only the views this combo's
+            `source` needs are read out of it.
 
     Returns:
         (T, V, L, C, 3) -- views stacked on a dedicated axis, NOT into channels.
         For source=hs, V == 1.
     """
     per_view = []
-    for view in cfg.extract.views:
+    for view in VIEWS_FOR_SOURCE[source]:
         img = build_view_image(
-            qkv[view],
+            activations[view],
             n_cols=n_cols,
-            extraction_type=cfg.extract.extraction_type,
+            extraction_type=extraction_type,
             pool_mode=cfg.extract.pool,
             boundary_mode=cfg.extract.boundary_mode,
         )  # (T, L, C, 3)
@@ -235,9 +266,123 @@ def _record_from_meta(out_dir: Path, idx: int) -> dict:
     }
 
 
+def roots_for(cfg: Config) -> dict[tuple[str, str], Path]:
+    """Every (source, extraction_type) combo's directory for this dataset+LLM.
+
+    Extraction always populates every combo in one run, so it needs all four
+    paths up front rather than only the one `cfg.extract` currently selects.
+    """
+    return {combo: cfg.example_dir_for(*combo) for combo in COMBOS}
+
+
+def _manifest_complete_indices(root: Path) -> set[int]:
+    """Indices manifest.jsonl already records as fully labeled, for `root`.
+
+    Reads ONLY manifest.jsonl (no per-example meta.txt/tokens.npy opens, no
+    dataset download) -- this is what lets `run_extraction` check "is
+    everything already done" before paying for `load_examples`/`load_llm`.
+    """
+    path = root / "manifest.jsonl"
+    if not path.exists():
+        return set()
+    done: set[int] = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            label = str(rec.get("label", "")).strip()
+            if label in ("0", "1"):
+                done.add(rec["idx"])
+    return done
+
+
+def _every_manifest_exists(roots: dict) -> bool:
+    """True if manifest.jsonl already exists for every combo.
+
+    write_manifest() is the LAST thing a run_extraction() call does (after
+    every example is generated AND labeled) -- so its existence alone is a
+    strong, near-free ("does this file exist") signal that a full
+    (non-chunked) extraction already finished. This is checked FIRST,
+    before the slower per-example is_complete()/is_generated() scan below,
+    since that scan opens 4 files per example (one meta.txt per combo) and
+    can itself be slow at thousands of examples on a networked filesystem.
+    """
+    return all((root / "manifest.jsonl").exists() for root in roots.values())
+
+
+def _already_fully_extracted(roots: dict, wanted_indices: set[int]) -> bool:
+    """True if every index in `wanted_indices` is already complete (tensor +
+    resolved label) in EVERY (source, extraction_type) combo's manifest.
+
+    Manifest-only check, so it costs a handful of small file reads --
+    deliberately cheap enough to run before `load_examples` (which may
+    download/iterate a full upstream HF dataset split) and before
+    `load_llm` (which loads the whole model onto a GPU), so a fully-finished
+    extraction can be recognised and skipped without paying either cost.
+    """
+    if not wanted_indices:
+        return False
+    return all(
+        wanted_indices <= _manifest_complete_indices(root)
+        for root in roots.values()
+    )
+
+
 def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = False) -> None:
-    root = cfg.example_dir()
-    root.mkdir(parents=True, exist_ok=True)
+    """Populate all four (source, extraction_type) directories for one dataset+LLM.
+
+    `cfg.extract.source`/`extraction_type` are NOT consulted here -- every combo
+    in COMBOS is always generated together (see module docstring). They still
+    matter to `train`/`test`/`cam`/`inspect`, which each read one combo.
+    """
+    roots = roots_for(cfg)
+    for root in roots.values():
+        root.mkdir(parents=True, exist_ok=True)
+    # Canonical dir used to decide resume/reuse and to store the shared
+    # response/gold text -- any one combo's dir carries the same generation
+    # result as the others, since generation does not depend on source/
+    # extraction_type at all.
+    canonical_source, canonical_extraction_type = COMBOS[0]
+    canonical_root = roots[(canonical_source, canonical_extraction_type)]
+
+    # Fastest possible pre-check, BEFORE load_examples()/load_llm() AND
+    # before the slower per-example is_complete()/is_generated() scan
+    # further below: does manifest.jsonl already exist for every combo?
+    # write_manifest() is the LAST thing a run finishes, so its existence
+    # alone (a handful of file-existence checks, no file contents read, no
+    # per-example meta.txt opens) is treated as decisive proof a prior
+    # non-chunked run already completed -- skip everything else entirely.
+    # Deliberately NOT stricter than this (e.g. does not verify the record
+    # count matches n_samples): an interrupted run whose manifest.jsonl
+    # exists but is short needs --overwrite to redo, the same as any other
+    # already-extracted corpus you want to force-regenerate.
+    #
+    # Chunked runs share one manifest.jsonl across chunks, so this
+    # file-existence check alone can't tell whether THIS chunk's range is
+    # done -- chunked calls use the (slower, but chunk-aware) index-set
+    # check below instead.
+    if not overwrite and chunk is None:
+        if _every_manifest_exists(roots):
+            logger.info(
+                "%s/%s: manifest.jsonl already exists for every (source, "
+                "extraction_type) combo -- treating as already extracted and "
+                "skipping load_examples/load_llm entirely (use --overwrite to redo)",
+                cfg.dataset.name, cfg.llm.alias,
+            )
+            return
+    elif not overwrite and chunk is not None:
+        lo, hi = (chunk - 1) * 1000, chunk * 1000
+        wanted = set(range(lo, hi))
+        if _already_fully_extracted(roots, wanted):
+            logger.info(
+                "%s/%s chunk %d: all %d requested examples already complete "
+                "in every (source, extraction_type) combo -- skipping "
+                "load_examples/load_llm entirely (use --overwrite to redo)",
+                cfg.dataset.name, cfg.llm.alias, chunk, len(wanted),
+            )
+            return
 
     examples = load_examples(cfg)
     logger.info("loaded %d examples for %s", len(examples), cfg.dataset.name)
@@ -254,22 +399,25 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
 
     # Partition the work BEFORE touching the GPU. Generation (one generate() per
     # example) is the only step that needs the LLM; labeling + manifest do not.
-    #   complete    -> already labeled; skip entirely.
-    #   generated   -> tensor + response on disk but unlabeled; REUSE it (no LLM),
-    #                  rebuild its record from meta.txt, and let labeling finish it.
-    #   to_generate -> needs the model.
+    #   complete    -> already labeled in EVERY combo; skip entirely.
+    #   generated   -> tensor + response on disk (in every combo) but unlabeled;
+    #                  REUSE it (no LLM), rebuild its record from meta.txt, and
+    #                  let labeling finish it.
+    #   to_generate -> at least one combo is missing this example; needs the model.
     # This is what lets a run whose generation finished but crashed before
     # labeling pick up straight at the post-generation step, without re-running
-    # the model on 10k prompts.
+    # the model on 10k prompts. A partially-populated combo set (e.g. a run that
+    # was interrupted mid-write-out) is treated as needing regeneration for
+    # every combo, since generation is cheap to redo relative to correctness.
     reused: list[dict] = []
     to_generate = []
     skipped = 0
     for ex in examples:
-        out_dir = root / f"{ex.idx:05d}"
-        if not overwrite and is_complete(out_dir):
+        dirs = [root / f"{ex.idx:05d}" for root in roots.values()]
+        if not overwrite and all(is_complete(d) for d in dirs):
             skipped += 1
-        elif not overwrite and is_generated(out_dir):
-            reused.append(_record_from_meta(out_dir, ex.idx))
+        elif not overwrite and all(is_generated(d) for d in dirs):
+            reused.append(_record_from_meta(canonical_root / f"{ex.idx:05d}", ex.idx))
         else:
             to_generate.append(ex)
 
@@ -306,34 +454,37 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
         # is the design: we pool D down to L rather than reshaping a rectangle. Not
         # every model admits that default (Qwen2.5-7B's L=28 does not divide its
         # D_kv=512), so this raises with the valid alternatives if it cannot.
+        # Checked against Q/K/V AND H together now, since one run captures both.
         n_cols = cfg.extract.n_cols or geom.n_layers
-        geom.check_n_cols(n_cols, views=tuple(cfg.extract.views))
-        for view in cfg.extract.views:
+        geom.check_n_cols(n_cols, views=VIEWS + (HS_VIEW,))
+        for view in VIEWS + (HS_VIEW,):
             d = geom.feature_dim(view)
             logger.info("view %s: D=%d -> %d cols (chunk width %d)", view, d, n_cols, d // n_cols)
 
         n_rows = cfg.extract.l_eff or geom.n_layers
         logger.info(
-            "image shape per token: %d views x (%d layers x %d cols x 3 chans)",
-            len(cfg.extract.views), n_rows, n_cols,
+            "image shape per token: 4 views (Q,K,V,H) x (%d layers x %d cols x 3 chans), "
+            "x2 extraction_type (delta, transforms)",
+            n_rows, n_cols,
         )
 
-        (root / "geometry.json").write_text(
-            json.dumps(
-                {
-                    "llm": cfg.llm.name,
-                    "geometry": asdict(geom),
-                    "source": cfg.extract.source,
-                    "extraction_type": cfg.extract.extraction_type,
-                    "n_cols": n_cols,
-                    "n_rows": n_rows,
-                    "views": cfg.extract.views,
-                    "pool": cfg.extract.pool,
-                    "boundary_mode": cfg.extract.boundary_mode,
-                },
-                indent=2,
+        for (source, extraction_type), root in roots.items():
+            (root / "geometry.json").write_text(
+                json.dumps(
+                    {
+                        "llm": cfg.llm.name,
+                        "geometry": asdict(geom),
+                        "source": source,
+                        "extraction_type": extraction_type,
+                        "n_cols": n_cols,
+                        "n_rows": n_rows,
+                        "views": list(VIEWS_FOR_SOURCE[source]),
+                        "pool": cfg.extract.pool,
+                        "boundary_mode": cfg.extract.boundary_mode,
+                    },
+                    indent=2,
+                )
             )
-        )
 
         save_dtype = DTYPES[cfg.extract.dtype]
 
@@ -352,8 +503,9 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
 
         # Plain-text progress log next to geometry.json: one line every 100
         # examples ("i/total"), so a long extraction's progress can be checked
-        # without tailing a log file full of generation internals.
-        progress_log = (root / "progress.log").open("a")
+        # without tailing a log file full of generation internals. Kept in the
+        # canonical dir only -- one shared generation pass, one log.
+        progress_log = (canonical_root / "progress.log").open("a")
         total_to_generate = len(to_generate)
         batch_size = max(1, cfg.extract.batch_size)
         batches = [
@@ -366,27 +518,20 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
             prompt_ids = [build_prompt_ids(ex.prompt, tokenizer, device) for ex in batch]
             input_ids, attention_mask = left_pad_batch(prompt_ids, pad_id, device)
 
-            if cfg.extract.source == "hs":
-                batch_out = capture_hidden(
-                    model,
-                    input_ids,
-                    max_new_tokens=cfg.dataset.max_new_tokens,
-                    eos_token_id=stop_ids,
-                    attention_mask=attention_mask,
-                )
-            else:
-                batch_out = capture_qkv(
-                    model,
-                    input_ids,
-                    views=tuple(cfg.extract.views),
-                    max_new_tokens=cfg.dataset.max_new_tokens,
-                    eos_token_id=stop_ids,
-                    attention_mask=attention_mask,
-                )
+            # One decode loop per batch, capturing Q/K/V AND hidden states
+            # together -- every (source, extraction_type) combo below is built
+            # from this single generation pass.
+            batch_out = capture_all(
+                model,
+                input_ids,
+                views=VIEWS,
+                max_new_tokens=cfg.dataset.max_new_tokens,
+                eos_token_id=stop_ids,
+                attention_mask=attention_mask,
+            )
 
-            for ex, (qkv, gen_ids) in zip(batch, batch_out):
+            for ex, (activations, gen_ids) in zip(batch, batch_out):
                 n_done += 1
-                out_dir = root / f"{ex.idx:05d}"
 
                 if gen_ids.numel() == 0:
                     logger.warning("example %d generated nothing; skipping", ex.idx)
@@ -397,25 +542,33 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
                 # Truncate to max_tokens BEFORE building images: this caps both
                 # compute and disk. The response text is left whole so the label
                 # reflects what the model actually said.
-                if cfg.extract.max_tokens and qkv[cfg.extract.views[0]].shape[0] > cfg.extract.max_tokens:
-                    qkv = {v: t[: cfg.extract.max_tokens] for v, t in qkv.items()}
+                if cfg.extract.max_tokens and activations[HS_VIEW].shape[0] > cfg.extract.max_tokens:
+                    activations = {v: t[: cfg.extract.max_tokens] for v, t in activations.items()}
 
-                images = build_images(qkv, cfg, n_cols=n_cols)
+                n_tokens = None
+                for (source, extraction_type), root in roots.items():
+                    out_dir = root / f"{ex.idx:05d}"
+                    images = build_images(
+                        activations, cfg, n_cols=n_cols,
+                        source=source, extraction_type=extraction_type,
+                    )
+                    if n_tokens is None:
+                        n_tokens = int(images.shape[0])
+                    # Written after labeling below; stash the tensor for now.
+                    write_example(
+                        out_dir, images, ex.prompt, response, ex.gold,
+                        score=float("nan"), label=-1, save_dtype=save_dtype,
+                    )
 
                 records.append(
                     {
                         "idx": ex.idx,
-                        "dir": out_dir.name,
-                        "n_tokens": int(images.shape[0]),
+                        "dir": f"{ex.idx:05d}",
+                        "n_tokens": n_tokens,
                         "prompt": ex.prompt,
                         "response": response,
                         "gold": ex.gold,
                     }
-                )
-                # Written after labeling below; stash the tensor path for now.
-                write_example(
-                    out_dir, images, ex.prompt, response, ex.gold,
-                    score=float("nan"), label=-1, save_dtype=save_dtype,
                 )
 
                 if n_done % 100 == 0 or n_done == total_to_generate:
@@ -430,7 +583,8 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
         logger.warning("no new examples extracted")
         return
 
-    # ---- label, and rewrite meta with the resolved score/label -------------
+    # ---- label ONCE (the response text is identical across every combo), and
+    # copy the resolved score/label into every combo's meta.txt -------------
     logger.info("labeling %d examples with scheme=%s", len(records), cfg.labeling.scheme)
     scored = label_examples(
         cfg, [r["response"] for r in records], [r["gold"] for r in records]
@@ -439,13 +593,15 @@ def run_extraction(cfg: Config, chunk: int | None = None, overwrite: bool = Fals
     for rec, (score, label) in zip(records, scored):
         rec["score"] = score
         rec["label"] = label
-        out_dir = root / rec["dir"]
-        (out_dir / "meta.txt").write_text(
-            format_meta(rec["prompt"], rec["response"], rec["gold"], score, label),
-            encoding="utf-8",
-        )
+        for root in roots.values():
+            out_dir = root / rec["dir"]
+            (out_dir / "meta.txt").write_text(
+                format_meta(rec["prompt"], rec["response"], rec["gold"], score, label),
+                encoding="utf-8",
+            )
 
-    write_manifest(root, records, chunk)
+    for root in roots.values():
+        write_manifest(root, records, chunk)
 
     n_hall = sum(r["label"] for r in records)
     logger.info(

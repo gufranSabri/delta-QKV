@@ -2,13 +2,14 @@ DATASET=triviaqa
 MODEL=llama2_7b
 
 # ============================================================================
-# Extraction: qkv (Q/K/V projections) AND hs (hidden states) for this dataset.
-# The qkv ablation loop below reads the qkv extraction; the hs block at the
-# bottom reads the hs one. Both must run before their respective train/test
-# calls -- extraction only needs to happen once per (source, dataset, model).
+# Extraction: one call populates qkv AND hs (Q/K/V projections + hidden states)
+# together, from a single generation pass -- extract.source/extraction_type
+# are not consulted by `extract` (see src/extract/run_extraction.py), only by
+# `train`/`test`/`cam`/`inspect`. The qkv ablation loop below reads the qkv
+# side; the hs block at the bottom reads the hs side. Only needs to run once
+# per (dataset, model).
 # ============================================================================
 # python main.py --config configs/$DATASET/$MODEL.yaml extract --set extract.batch_size=16
-# python main.py --config configs/$DATASET/$MODEL.yaml extract --set extract.source=hs --set "extract.views=[H]" --set extract.batch_size=16
 
 # ============================================================================
 # Ablation (qkv source): every (channels, include) combination.

@@ -25,9 +25,10 @@ DATASETS=(
 )
 
 MODELS=(
-    llama3.1_8b
     qwen2.5_7b
-    llama2_7b
+    # llama2_7b
+    # llama3.1_8b
+    # opt_6.7b
 )
 
 # truthfulqa/triviaqa/coqa all mirror HalluShift's single-split
@@ -43,20 +44,19 @@ for DATASET in "${DATASETS[@]}"; do
         echo "Model:   $MODEL"
         echo "========================================"
 
-        # Extract training set
+        # Extract training set. One call populates every (source, extraction_type)
+        # combination (qkv/hs x delta/transforms) from a single generation pass --
+        # extract.source/extraction_type are not consulted by `extract` (see
+        # src/extract/run_extraction.py), only by `train`/`test`/`cam`/`inspect`.
         python main.py --config configs/$DATASET/$MODEL.yaml extract \
             --set extract.batch_size=8
 
-        python main.py --config configs/$DATASET/$MODEL.yaml extract \
-            --set extract.batch_size=8 --set extract.extraction_type=delta
-
         # Inspect first 10 examples
-        for i in {0..9}; do
-            python main.py \
-                --config configs/$DATASET/$MODEL.yaml \
-                inspect \
-                --idx $i
-
-        done
+        # for i in {0..9}; do
+        #     python main.py \
+        #         --config configs/$DATASET/$MODEL.yaml \
+        #         inspect \
+        #         --idx $i
+        # done
     done
 done
